@@ -5,7 +5,7 @@ import torch.nn.functional as F
 import numpy as np
 import os
 from tqdm import tqdm
-from networks import VAE_Encoder, VAE_Decoder, SequenceDiscriminator, BilateralGenerator
+from networks import AutoregressiveVAE, SequenceDiscriminator, BilateralGenerator
 from ultils import nt_xent_loss, kl_divergence, feature_matching_loss, np_rounding
 from visualise import visualise_gan, visualise_vae
 
@@ -19,19 +19,18 @@ def train_m3gan(dataloader, config, max_val_con, min_val_con):
     noise_dim = config['noise_dim']
     time_steps = config['time_steps']
 
-    c_enc = VAE_Encoder(c_dim, hidden_dim, latent_dim, config['enc_layers']).to(device)
-    c_dec = VAE_Decoder(latent_dim, hidden_dim, c_dim, config['dec_layers']).to(device)
-    d_enc = VAE_Encoder(d_dim, hidden_dim, latent_dim, config['enc_layers']).to(device)
-    d_dec = VAE_Decoder(latent_dim, hidden_dim, d_dim, config['dec_layers']).to(device)
+    # Sử dụng Class VAE bao bọc Autoregressive mới
+    c_vae = AutoregressiveVAE(c_dim, hidden_dim, latent_dim, config['enc_layers'], config['dec_layers'], time_steps).to(device)
+    d_vae = AutoregressiveVAE(d_dim, hidden_dim, latent_dim, config['enc_layers'], config['dec_layers'], time_steps).to(device)
 
     c_gen = BilateralGenerator(noise_dim, hidden_dim, latent_dim, config['gen_layers']).to(device)
     d_gen = BilateralGenerator(noise_dim, hidden_dim, latent_dim, config['gen_layers']).to(device)
 
-    c_dis = SequenceDiscriminator(c_dim, hidden_dim, config['dis_layers']).to(device)
-    d_dis = SequenceDiscriminator(d_dim, hidden_dim, config['dis_layers']).to(device)
+    # Truyền thêm time_steps để phục vụ cho thao tác ép phẳng chuỗi (flatten)
+    c_dis = SequenceDiscriminator(c_dim, hidden_dim, time_steps, config['dis_layers']).to(device)
+    d_dis = SequenceDiscriminator(d_dim, hidden_dim, time_steps, config['dis_layers']).to(device)
 
-    vae_params = list(c_enc.parameters()) + list(c_dec.parameters()) + \
-                 list(d_enc.parameters()) + list(d_dec.parameters())
+    vae_params = list(c_vae.parameters()) + list(d_vae.parameters())
     optimizer_VAE_pre = optim.Adam(vae_params, lr=config['v_lr_pre'])
     optimizer_VAE = optim.Adam(vae_params, lr=config['v_lr'])
 
@@ -44,13 +43,9 @@ def train_m3gan(dataloader, config, max_val_con, min_val_con):
         print(f"\nLoading pretrained weights from {config['resume_checkpoint']}...")
         checkpoint = torch.load(config['resume_checkpoint'], map_location=device)
 
-        # Use strictly to allow loading partial checkpoints (like just the VAE)
-        if 'c_enc' in checkpoint: c_enc.load_state_dict(checkpoint['c_enc'])
-        if 'c_dec' in checkpoint: c_dec.load_state_dict(checkpoint['c_dec'])
-        if 'd_enc' in checkpoint: d_enc.load_state_dict(checkpoint['d_enc'])
-        if 'd_dec' in checkpoint: d_dec.load_state_dict(checkpoint['d_dec'])
+        if 'c_vae' in checkpoint: c_vae.load_state_dict(checkpoint['c_vae'])
+        if 'd_vae' in checkpoint: d_vae.load_state_dict(checkpoint['d_vae'])
 
-        # If resuming Phase 2, load the GAN components too
         if 'c_gen' in checkpoint: c_gen.load_state_dict(checkpoint['c_gen'])
         if 'd_gen' in checkpoint: d_gen.load_state_dict(checkpoint['d_gen'])
         if 'c_dis' in checkpoint: c_dis.load_state_dict(checkpoint['c_dis'])
@@ -60,10 +55,8 @@ def train_m3gan(dataloader, config, max_val_con, min_val_con):
     # ---------------------------------------------------------
     # Phase 1: Pretrain VAE
     # ---------------------------------------------------------
-    c_enc.train()
-    c_dec.train()
-    d_enc.train()
-    d_dec.train()
+    c_vae.train()
+    d_vae.train()
 
     best_vae_loss = float('inf')
     epochs_no_improve = 0
@@ -77,17 +70,13 @@ def train_m3gan(dataloader, config, max_val_con, min_val_con):
         pbar = tqdm(dataloader, desc=f"Pretrain Epoch [{epoch + 1}/{config['num_pre_epochs']}]", leave=True)
 
         for continuous_x, discrete_x in pbar:
-            # Absolute input sanitization
             continuous_x = torch.clamp(torch.nan_to_num(continuous_x.to(device), nan=0.0), 0.0, 1.0)
             discrete_x = torch.clamp(torch.nan_to_num(discrete_x.to(device), nan=0.0), 0.0, 1.0)
 
             optimizer_VAE_pre.zero_grad()
 
-            c_z, c_mu, c_logvar = c_enc(continuous_x)
-            c_rec, _ = c_dec(c_z)
-
-            d_z, d_mu, d_logvar = d_enc(discrete_x)
-            d_rec, d_logits = d_dec(d_z)
+            c_rec, _, c_mu, c_logvar, c_z = c_vae(continuous_x)
+            d_rec, d_logits, d_mu, d_logvar, d_z = d_vae(discrete_x)
 
             loss_c_rec = F.mse_loss(c_rec, continuous_x)
             loss_d_rec = F.binary_cross_entropy_with_logits(d_logits, discrete_x)
@@ -122,34 +111,25 @@ def train_m3gan(dataloader, config, max_val_con, min_val_con):
                 d_real_lst.append(discrete_x.detach().cpu().numpy())
                 d_rec_lst.append(np_rounding(d_rec.detach().cpu().numpy()))
 
-        # --- Phase 1 Early Stopping Logic ---
         avg_epoch_loss = epoch_total_loss / len(dataloader)
         if avg_epoch_loss < best_vae_loss:
             best_vae_loss = avg_epoch_loss
             epochs_no_improve = 0
             os.makedirs(ckpt_dir, exist_ok=True)
             torch.save({
-                'c_enc': c_enc.state_dict(),
-                'c_dec': c_dec.state_dict(),
-                'd_enc': d_enc.state_dict(),
-                'd_dec': d_dec.state_dict(),
+                'c_vae': c_vae.state_dict(),
+                'd_vae': d_vae.state_dict(),
             }, os.path.join(ckpt_dir, "best_pretrain_vae.pth"))
         else:
             epochs_no_improve += 1
-            print(f"--- No improvement in VAE loss for {epochs_no_improve} epochs ---")
 
             if epochs_no_improve >= patience:
                 print(f"\n🛑 Early stopping triggered at epoch {epoch + 1}! VAE has converged.")
-                print(f"Loading the best VAE weights (Loss: {best_vae_loss:.4f}) before proceeding to Phase 2...\n")
-
                 best_ckpt = torch.load(os.path.join(ckpt_dir, "best_pretrain_vae.pth"))
-                c_enc.load_state_dict(best_ckpt['c_enc'])
-                c_dec.load_state_dict(best_ckpt['c_dec'])
-                d_enc.load_state_dict(best_ckpt['d_enc'])
-                d_dec.load_state_dict(best_ckpt['d_dec'])
+                c_vae.load_state_dict(best_ckpt['c_vae'])
+                d_vae.load_state_dict(best_ckpt['d_vae'])
                 break
 
-        # Save checkpoints and plots based on frequency
         if (epoch + 1) % config['epoch_ckpt_freq'] == 0 or epoch == config['num_pre_epochs'] - 1:
             visualise_vae(np.vstack(c_real_lst), np.vstack(c_rec_lst),
                           np.vstack(d_real_lst), np.vstack(d_rec_lst),
@@ -161,10 +141,8 @@ def train_m3gan(dataloader, config, max_val_con, min_val_con):
 
             os.makedirs(ckpt_dir, exist_ok=True)
             torch.save({
-                'c_enc': c_enc.state_dict(),
-                'c_dec': c_dec.state_dict(),
-                'd_enc': d_enc.state_dict(),
-                'd_dec': d_dec.state_dict(),
+                'c_vae': c_vae.state_dict(),
+                'd_vae': d_vae.state_dict(),
             }, os.path.join(ckpt_dir, f"pretrain_vae_epoch_{epoch + 1}.pth"))
 
     # ---------------------------------------------------------
@@ -191,15 +169,16 @@ def train_m3gan(dataloader, config, max_val_con, min_val_con):
                 c_real_lst.append(continuous_x.detach().cpu().numpy())
                 d_real_lst.append(discrete_x.detach().cpu().numpy())
 
-            real_labels = torch.clamp(torch.empty((batch_size, time_steps), device=device).uniform_(0.8, 1.0), 0.0, 1.0)
-            fake_labels = torch.empty((batch_size, time_steps), device=device).uniform_(0.0, 0.3)
+            # Discriminator giờ output [batch_size], nên real/fake labels đổi thành vector 1 chiều
+            real_labels = torch.clamp(torch.empty((batch_size,), device=device).uniform_(0.8, 1.0), 0.0, 1.0)
+            fake_labels = torch.empty((batch_size,), device=device).uniform_(0.0, 0.3)
 
             # --- Update Discriminator ---
             d_loss = torch.tensor(0.0)
             for _ in range(config['d_rounds']):
                 optimizer_D.zero_grad()
-                c_dec.eval()
-                d_dec.eval()
+                c_vae.eval()
+                d_vae.eval()
 
                 noise_c = torch.randn(batch_size, time_steps, noise_dim, device=device)
                 noise_d = torch.randn(batch_size, time_steps, noise_dim, device=device)
@@ -211,8 +190,8 @@ def train_m3gan(dataloader, config, max_val_con, min_val_con):
                 fake_z_d, h_cpl_c = d_gen(noise_d, h_cpl_c)
 
                 with torch.no_grad():
-                    fake_c_seq, _ = c_dec(fake_z_c)
-                    fake_d_seq, _ = d_dec(fake_z_d)
+                    fake_c_seq, _ = c_vae.reconstruct_decoder(fake_z_c)
+                    fake_d_seq, _ = d_vae.reconstruct_decoder(fake_z_d)
 
                 c_real_logits, c_real_fm = c_dis(continuous_x)
                 d_real_logits, _ = d_dis(discrete_x)
@@ -240,10 +219,10 @@ def train_m3gan(dataloader, config, max_val_con, min_val_con):
                 fake_z_c, h_cpl_d = c_gen(noise_c, h_cpl_d)
                 fake_z_d, h_cpl_c = d_gen(noise_d, h_cpl_c)
 
-                c_dec.train()
-                d_dec.train()
-                fake_c_seq, _ = c_dec(fake_z_c)
-                fake_d_seq, _ = d_dec(fake_z_d)
+                c_vae.eval()
+                d_vae.eval()
+                fake_c_seq, _ = c_vae.reconstruct_decoder(fake_z_c)
+                fake_d_seq, _ = d_vae.reconstruct_decoder(fake_z_d)
 
                 c_fake_logits, c_fake_fm = c_dis(fake_c_seq)
                 d_fake_logits, _ = d_dis(fake_d_seq)
@@ -269,17 +248,12 @@ def train_m3gan(dataloader, config, max_val_con, min_val_con):
             # --- Update VAE ---
             total_vae_loss = torch.tensor(0.0)
             for _ in range(config['v_rounds']):
-                c_enc.train()
-                c_dec.train()
-                d_enc.train()
-                d_dec.train()
+                c_vae.train()
+                d_vae.train()
                 optimizer_VAE.zero_grad()
 
-                c_z, c_mu, c_logvar = c_enc(continuous_x)
-                c_rec, _ = c_dec(c_z)
-
-                d_z, d_mu, d_logvar = d_enc(discrete_x)
-                d_rec, d_logits = d_dec(d_z)
+                c_rec, c_logits, c_mu, c_logvar, c_z = c_vae(continuous_x)
+                d_rec, d_logits, d_mu, d_logvar, d_z = d_vae(discrete_x)
 
                 loss_c_rec = F.mse_loss(c_rec, continuous_x)
                 loss_d_rec = F.binary_cross_entropy_with_logits(d_logits, discrete_x)
@@ -307,7 +281,6 @@ def train_m3gan(dataloader, config, max_val_con, min_val_con):
                 v_loss=f"{total_vae_loss.item():.4f}"
             )
 
-        # --- Phase 2 Early Stopping Logic ---
         avg_epoch_g_loss = epoch_g_loss / len(dataloader)
         if avg_epoch_g_loss < best_gan_loss:
             best_gan_loss = avg_epoch_g_loss
@@ -319,34 +292,25 @@ def train_m3gan(dataloader, config, max_val_con, min_val_con):
                 'd_gen': d_gen.state_dict(),
                 'c_dis': c_dis.state_dict(),
                 'd_dis': d_dis.state_dict(),
-                'c_enc': c_enc.state_dict(),
-                'c_dec': c_dec.state_dict(),
-                'd_enc': d_enc.state_dict(),
-                'd_dec': d_dec.state_dict(),
+                'c_vae': c_vae.state_dict(),
+                'd_vae': d_vae.state_dict(),
             }, os.path.join(ckpt_dir, "best_m3gan.pth"))
         else:
             epochs_no_improve_gan += 1
-            print(f"--- No improvement in GAN Generator loss for {epochs_no_improve_gan} epochs ---")
-
             if epochs_no_improve_gan >= patience:
                 print(f"\n🛑 Early stopping triggered at epoch {epoch + 1}! Joint GAN has converged.")
-                print(f"Loading the best GAN weights (G Loss: {best_gan_loss:.4f}) before finishing...\n")
-
                 best_ckpt = torch.load(os.path.join(ckpt_dir, "best_m3gan.pth"))
                 c_gen.load_state_dict(best_ckpt['c_gen'])
                 d_gen.load_state_dict(best_ckpt['d_gen'])
                 c_dis.load_state_dict(best_ckpt['c_dis'])
                 d_dis.load_state_dict(best_ckpt['d_dis'])
-                c_enc.load_state_dict(best_ckpt['c_enc'])
-                c_dec.load_state_dict(best_ckpt['c_dec'])
-                d_enc.load_state_dict(best_ckpt['d_enc'])
-                d_dec.load_state_dict(best_ckpt['d_dec'])
+                c_vae.load_state_dict(best_ckpt['c_vae'])
+                d_vae.load_state_dict(best_ckpt['d_vae'])
                 break
 
-        # Save checkpoints and plots based on frequency
         if (epoch + 1) % config['epoch_ckpt_freq'] == 0 or epoch == config['num_epochs'] - 1:
-            c_dec.eval()
-            d_dec.eval()
+            c_vae.eval()
+            d_vae.eval()
             c_gen.eval()
             d_gen.eval()
             d_gen_data, c_gen_data = [], []
@@ -364,8 +328,8 @@ def train_m3gan(dataloader, config, max_val_con, min_val_con):
                     fake_z_c, h_cpl_d = c_gen(noise_c, h_cpl_d)
                     fake_z_d, h_cpl_c = d_gen(noise_d, h_cpl_c)
 
-                    fake_c_seq, _ = c_dec(fake_z_c)
-                    fake_d_seq, _ = d_dec(fake_z_d)
+                    fake_c_seq, _ = c_vae.reconstruct_decoder(fake_z_c)
+                    fake_d_seq, _ = d_vae.reconstruct_decoder(fake_z_d)
 
                     c_gen_data.append(fake_c_seq.cpu().numpy())
                     d_gen_data.append(fake_d_seq.cpu().numpy())
@@ -390,13 +354,6 @@ def train_m3gan(dataloader, config, max_val_con, min_val_con):
                 'd_gen': d_gen.state_dict(),
                 'c_dis': c_dis.state_dict(),
                 'd_dis': d_dis.state_dict(),
-                'c_enc': c_enc.state_dict(),
-                'c_dec': c_dec.state_dict(),
-                'd_enc': d_enc.state_dict(),
-                'd_dec': d_dec.state_dict(),
+                'c_vae': c_vae.state_dict(),
+                'd_vae': d_vae.state_dict(),
             }, os.path.join(ckpt_dir, f"m3gan_epoch_{epoch + 1}.pth"))
-
-            c_dec.train()
-            d_dec.train()
-            c_gen.train()
-            d_gen.train()

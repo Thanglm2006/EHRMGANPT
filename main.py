@@ -1,17 +1,18 @@
 # main.py
 import torch
 import os
+
 os.environ['CUDA_LAUNCH_BLOCKING'] = "1"
 from torch.utils.data import TensorDataset, DataLoader
 import numpy as np
 import pickle
 import argparse
-import os
 from trainer import train_m3gan
 from metrics import evaluate_all
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
+
 
 def main(args):
     # 1. Load Real Data
@@ -22,24 +23,20 @@ def main(args):
 
     with open(os.path.join(data_path, 'med_interv_24hrs.pkl'), 'rb') as f:
         discrete_x = pickle.load(f)
+
     discrete_x = np.nan_to_num(discrete_x, nan=0.0)
     discrete_x = np.clip(discrete_x, 0.0, 1.0)
-
     continuous_x = np.nan_to_num(continuous_x, nan=0.0)
 
     min_val_con = np.min(continuous_x, axis=(0, 1))
     max_val_con = np.max(continuous_x, axis=(0, 1))
 
-    # 2. Prevent division by zero for constant features
+    # Prevent division by zero for constant features
     range_val_con = max_val_con - min_val_con
     range_val_con[range_val_con == 0] = 1e-6
 
     # Normalize the data to [0, 1] for the VAE Sigmoid output
     continuous_x = (continuous_x - min_val_con) / range_val_con
-
-    # In the original utils.py, `renormlizer` multiplies by max_val and adds min_val.
-    # Because of how their specific renormlizer math works: X_orig = X_norm * range + min
-    # We must pass the `range` as the max_val parameter for their function to work correctly.
     max_val_con = range_val_con
 
     # 2. Extract Dimensions
@@ -49,7 +46,7 @@ def main(args):
 
     # Paper defaults
     shared_latent_dim = 25
-    noise_dim = min(int(c_dim / 2), int(d_dim / 2))  # Standardized noise dim for the dual generator
+    noise_dim = min(int(c_dim / 2), int(d_dim / 2))
 
     # 3. Create PyTorch DataLoader
     dataset = TensorDataset(
@@ -94,7 +91,10 @@ def main(args):
         'c_beta_adv': args.c_beta_adv,
         'c_beta_fm': args.c_beta_fm,
         'd_beta_adv': args.d_beta_adv,
-        'd_beta_fm': args.d_beta_fm
+        'd_beta_fm': args.d_beta_fm,
+
+        'resume_checkpoint': args.resume_checkpoint,
+        'patience': args.patience
     }
 
     # 5. Start Training
@@ -104,33 +104,26 @@ def main(args):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-
     parser.add_argument('--dataset', type=str, default="mimic", choices=['Mimic3', 'eicu', 'hirid'])
-
     parser.add_argument('--batch_size', type=int, default=256)
     parser.add_argument('--num_pre_epochs', type=int, default=500)
     parser.add_argument('--num_epochs', type=int, default=800)
     parser.add_argument('--epoch_ckpt_freq', type=int, default=100)
-
     parser.add_argument('--d_rounds', type=int, default=1)
     parser.add_argument('--g_rounds', type=int, default=3)
     parser.add_argument('--v_rounds', type=int, default=1)
-
     parser.add_argument('--v_lr_pre', type=float, default=0.0005)
     parser.add_argument('--v_lr', type=float, default=0.0001)
     parser.add_argument('--g_lr', type=float, default=0.0001)
     parser.add_argument('--d_lr', type=float, default=0.0001)
-
     parser.add_argument('--alpha_re', type=float, default=1)
     parser.add_argument('--alpha_kl', type=float, default=0.5)
     parser.add_argument('--alpha_mt', type=float, default=0.1)
     parser.add_argument('--alpha_ct', type=float, default=0.1)
-
     parser.add_argument('--c_beta_adv', type=float, default=1)
     parser.add_argument('--c_beta_fm', type=float, default=20)
     parser.add_argument('--d_beta_adv', type=float, default=1)
     parser.add_argument('--d_beta_fm', type=float, default=20)
-
     parser.add_argument('--enc_layers', type=int, default=3)
     parser.add_argument('--dec_layers', type=int, default=3)
     parser.add_argument('--gen_num_units', type=int, default=512)
@@ -138,6 +131,6 @@ if __name__ == '__main__':
     parser.add_argument('--dis_num_layers', type=int, default=3)
     parser.add_argument('--resume_checkpoint', type=str, default=None, help="Path to .pth file to load weights from")
     parser.add_argument('--patience', type=int, default=30, help="Early stopping patience for VAE pretraining")
-    args = parser.parse_args()
 
+    args = parser.parse_args()
     main(args)
