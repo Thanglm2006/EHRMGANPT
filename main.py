@@ -94,7 +94,8 @@ def main(args):
         'd_beta_fm': args.d_beta_fm,
 
         'resume_checkpoint': args.resume_checkpoint,
-        'patience': args.patience
+        'patience': args.patience,
+        'skip_pretrain': args.skip_pretrain
     }
 
     # 5. Start Training
@@ -131,6 +132,8 @@ if __name__ == '__main__':
     parser.add_argument('--dis_num_layers', type=int, default=3)
     parser.add_argument('--resume_checkpoint', type=str, default=None, help="Path to .pth file to load weights from")
     parser.add_argument('--patience', type=int, default=30, help="Early stopping patience for VAE pretraining")
+    parser.add_argument('--skip_pretrain', action='store_true', help="Skip Phase 1: VAE Pretraining and go straight to Joint GAN")
+
 
     args = parser.parse_args()
     main(args)

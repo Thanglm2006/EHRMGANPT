@@ -63,87 +63,90 @@ def train_m3gan(dataloader, config, max_val_con, min_val_con):
     patience = config.get('patience', 200)
     ckpt_dir = "Output/checkpoint/"
 
-    print("\n=== Starting Phase 1: VAE Pretraining ===")
-    for epoch in range(config['num_pre_epochs']):
-        c_real_lst, c_rec_lst, d_real_lst, d_rec_lst = [], [], [], []
-        epoch_total_loss = 0.0
-        pbar = tqdm(dataloader, desc=f"Pretrain Epoch [{epoch + 1}/{config['num_pre_epochs']}]", leave=True)
+    if not config.get('skip_pretrain', False):
+        print("\n=== Starting Phase 1: VAE Pretraining ===")
+        for epoch in range(config['num_pre_epochs']):
+            c_real_lst, c_rec_lst, d_real_lst, d_rec_lst = [], [], [], []
+            epoch_total_loss = 0.0
+            pbar = tqdm(dataloader, desc=f"Pretrain Epoch [{epoch + 1}/{config['num_pre_epochs']}]", leave=True)
 
-        for continuous_x, discrete_x in pbar:
-            continuous_x = torch.clamp(torch.nan_to_num(continuous_x.to(device), nan=0.0), 0.0, 1.0)
-            discrete_x = torch.clamp(torch.nan_to_num(discrete_x.to(device), nan=0.0), 0.0, 1.0)
+            for continuous_x, discrete_x in pbar:
+                continuous_x = torch.clamp(torch.nan_to_num(continuous_x.to(device), nan=0.0), 0.0, 1.0)
+                discrete_x = torch.clamp(torch.nan_to_num(discrete_x.to(device), nan=0.0), 0.0, 1.0)
 
-            optimizer_VAE_pre.zero_grad()
+                optimizer_VAE_pre.zero_grad()
 
-            c_rec, _, c_mu, c_logvar, c_z = c_vae(continuous_x)
-            d_rec, d_logits, d_mu, d_logvar, d_z = d_vae(discrete_x)
+                c_rec, _, c_mu, c_logvar, c_z = c_vae(continuous_x)
+                d_rec, d_logits, d_mu, d_logvar, d_z = d_vae(discrete_x)
 
-            loss_c_rec = F.mse_loss(c_rec, continuous_x)
-            loss_d_rec = F.binary_cross_entropy_with_logits(d_logits, discrete_x)
+                loss_c_rec = F.mse_loss(c_rec, continuous_x)
+                loss_d_rec = F.binary_cross_entropy_with_logits(d_logits, discrete_x)
 
-            loss_c_kl = kl_divergence(c_mu, c_logvar)
-            loss_d_kl = kl_divergence(d_mu, d_logvar)
+                loss_c_kl = kl_divergence(c_mu, c_logvar)
+                loss_d_kl = kl_divergence(d_mu, d_logvar)
 
-            c_z_flat = c_z.view(c_z.size(0), -1)
-            d_z_flat = d_z.view(d_z.size(0), -1)
-            loss_contrastive = nt_xent_loss(c_z_flat, d_z_flat)
-            loss_matching = F.mse_loss(c_z, d_z)
+                c_z_flat = c_z.view(c_z.size(0), -1)
+                d_z_flat = d_z.view(d_z.size(0), -1)
+                loss_contrastive = nt_xent_loss(c_z_flat, d_z_flat)
+                loss_matching = F.mse_loss(c_z, d_z)
 
-            total_vae_loss = (config['alpha_re'] * (loss_c_rec + loss_d_rec) +
-                              config['alpha_kl'] * (loss_c_kl + loss_d_kl) +
-                              config['alpha_ct'] * loss_contrastive +
-                              config['alpha_mt'] * loss_matching)
+                total_vae_loss = (config['alpha_re'] * (loss_c_rec + loss_d_rec) +
+                                  config['alpha_kl'] * (loss_c_kl + loss_d_kl) +
+                                  config['alpha_ct'] * loss_contrastive +
+                                  config['alpha_mt'] * loss_matching)
 
-            total_vae_loss.backward()
-            torch.nn.utils.clip_grad_norm_(vae_params, max_norm=5.0)
-            optimizer_VAE_pre.step()
+                total_vae_loss.backward()
+                torch.nn.utils.clip_grad_norm_(vae_params, max_norm=5.0)
+                optimizer_VAE_pre.step()
 
-            epoch_total_loss += total_vae_loss.item()
-            pbar.set_postfix(
-                c_rec=f"{loss_c_rec.item():.4f}",
-                d_rec=f"{loss_d_rec.item():.4f}",
-                tot_vae=f"{total_vae_loss.item():.4f}"
-            )
+                epoch_total_loss += total_vae_loss.item()
+                pbar.set_postfix(
+                    c_rec=f"{loss_c_rec.item():.4f}",
+                    d_rec=f"{loss_d_rec.item():.4f}",
+                    tot_vae=f"{total_vae_loss.item():.4f}"
+                )
+
+                if (epoch + 1) % config['epoch_ckpt_freq'] == 0 or epoch == config['num_pre_epochs'] - 1:
+                    c_real_lst.append(continuous_x.detach().cpu().numpy())
+                    c_rec_lst.append(c_rec.detach().cpu().numpy())
+                    d_real_lst.append(discrete_x.detach().cpu().numpy())
+                    d_rec_lst.append(np_rounding(d_rec.detach().cpu().numpy()))
+
+            avg_epoch_loss = epoch_total_loss / len(dataloader)
+            if avg_epoch_loss < best_vae_loss:
+                best_vae_loss = avg_epoch_loss
+                epochs_no_improve = 0
+                os.makedirs(ckpt_dir, exist_ok=True)
+                torch.save({
+                    'c_vae': c_vae.state_dict(),
+                    'd_vae': d_vae.state_dict(),
+                }, os.path.join(ckpt_dir, "best_pretrain_vae.pth"))
+            else:
+                epochs_no_improve += 1
+
+                if epochs_no_improve >= patience:
+                    print(f"\n🛑 Early stopping triggered at epoch {epoch + 1}! VAE has converged.")
+                    best_ckpt = torch.load(os.path.join(ckpt_dir, "best_pretrain_vae.pth"))
+                    c_vae.load_state_dict(best_ckpt['c_vae'])
+                    d_vae.load_state_dict(best_ckpt['d_vae'])
+                    break
 
             if (epoch + 1) % config['epoch_ckpt_freq'] == 0 or epoch == config['num_pre_epochs'] - 1:
-                c_real_lst.append(continuous_x.detach().cpu().numpy())
-                c_rec_lst.append(c_rec.detach().cpu().numpy())
-                d_real_lst.append(discrete_x.detach().cpu().numpy())
-                d_rec_lst.append(np_rounding(d_rec.detach().cpu().numpy()))
+                visualise_vae(np.vstack(c_real_lst), np.vstack(c_rec_lst),
+                              np.vstack(d_real_lst), np.vstack(d_rec_lst),
+                              inx=(epoch + 1), max_val_con=max_val_con, min_val_con=min_val_con)
 
-        avg_epoch_loss = epoch_total_loss / len(dataloader)
-        if avg_epoch_loss < best_vae_loss:
-            best_vae_loss = avg_epoch_loss
-            epochs_no_improve = 0
-            os.makedirs(ckpt_dir, exist_ok=True)
-            torch.save({
-                'c_vae': c_vae.state_dict(),
-                'd_vae': d_vae.state_dict(),
-            }, os.path.join(ckpt_dir, "best_pretrain_vae.pth"))
-        else:
-            epochs_no_improve += 1
+                os.makedirs('Output/fake', exist_ok=True)
+                np.savez('Output/fake/vae.npz', c_real=np.vstack(c_real_lst), c_rec=np.vstack(c_rec_lst),
+                         d_real=np.vstack(d_real_lst), d_rec=np.vstack(d_rec_lst))
 
-            if epochs_no_improve >= patience:
-                print(f"\n🛑 Early stopping triggered at epoch {epoch + 1}! VAE has converged.")
-                best_ckpt = torch.load(os.path.join(ckpt_dir, "best_pretrain_vae.pth"))
-                c_vae.load_state_dict(best_ckpt['c_vae'])
-                d_vae.load_state_dict(best_ckpt['d_vae'])
-                break
-
-        if (epoch + 1) % config['epoch_ckpt_freq'] == 0 or epoch == config['num_pre_epochs'] - 1:
-            visualise_vae(np.vstack(c_real_lst), np.vstack(c_rec_lst),
-                          np.vstack(d_real_lst), np.vstack(d_rec_lst),
-                          inx=(epoch + 1), max_val_con=max_val_con, min_val_con=min_val_con)
-
-            os.makedirs('Output/fake', exist_ok=True)
-            np.savez('Output/fake/vae.npz', c_real=np.vstack(c_real_lst), c_rec=np.vstack(c_rec_lst),
-                     d_real=np.vstack(d_real_lst), d_rec=np.vstack(d_rec_lst))
-
-            os.makedirs(ckpt_dir, exist_ok=True)
-            torch.save({
-                'c_vae': c_vae.state_dict(),
-                'd_vae': d_vae.state_dict(),
-            }, os.path.join(ckpt_dir, f"pretrain_vae_epoch_{epoch + 1}.pth"))
+                os.makedirs(ckpt_dir, exist_ok=True)
+                torch.save({
+                    'c_vae': c_vae.state_dict(),
+                    'd_vae': d_vae.state_dict(),
+                }, os.path.join(ckpt_dir, f"pretrain_vae_epoch_{epoch + 1}.pth"))
+    else:
+        print("\n=== Skipping Phase 1: VAE Pretraining ===")
 
     # ---------------------------------------------------------
     # Phase 2: Joint GAN Training
