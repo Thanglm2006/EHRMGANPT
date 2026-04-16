@@ -19,14 +19,14 @@ def train_m3gan(dataloader, config, max_val_con, min_val_con):
     noise_dim = config['noise_dim']
     time_steps = config['time_steps']
 
-    # Sử dụng Class VAE bao bọc Autoregressive mới
+    # Using VAE Class to wrap the new Autoregressive architecture
     c_vae = AutoregressiveVAE(c_dim, hidden_dim, latent_dim, config['enc_layers'], config['dec_layers'], time_steps).to(device)
     d_vae = AutoregressiveVAE(d_dim, hidden_dim, latent_dim, config['enc_layers'], config['dec_layers'], time_steps).to(device)
 
     c_gen = BilateralGenerator(noise_dim, hidden_dim, latent_dim, config['gen_layers']).to(device)
     d_gen = BilateralGenerator(noise_dim, hidden_dim, latent_dim, config['gen_layers']).to(device)
 
-    # Truyền thêm time_steps để phục vụ cho thao tác ép phẳng chuỗi (flatten)
+    # Pass time_steps for flattening operations in Discriminator
     c_dis = SequenceDiscriminator(c_dim, hidden_dim, time_steps, config['dis_layers']).to(device)
     d_dis = SequenceDiscriminator(d_dim, hidden_dim, time_steps, config['dis_layers']).to(device)
 
@@ -169,7 +169,7 @@ def train_m3gan(dataloader, config, max_val_con, min_val_con):
                 c_real_lst.append(continuous_x.detach().cpu().numpy())
                 d_real_lst.append(discrete_x.detach().cpu().numpy())
 
-            # Discriminator giờ output [batch_size], nên real/fake labels đổi thành vector 1 chiều
+            # Discriminator now outputs [batch_size], so real/fake labels are 1D vectors
             real_labels = torch.clamp(torch.empty((batch_size,), device=device).uniform_(0.8, 1.0), 0.0, 1.0)
             fake_labels = torch.empty((batch_size,), device=device).uniform_(0.0, 0.3)
 
@@ -277,7 +277,8 @@ def train_m3gan(dataloader, config, max_val_con, min_val_con):
 
             pbar.set_postfix(
                 d_loss=f"{d_loss.item():.4f}",
-                g_loss=f"{g_loss.item():.4f}",
+                g_adv=f"{(g_adv_loss_c + g_adv_loss_d).item():.4f}",
+                g_fm=f"{(config['c_beta_fm'] * g_fm_loss_c + config['d_beta_fm'] * g_fm_loss_d).item():.4f}",
                 v_loss=f"{total_vae_loss.item():.4f}"
             )
 

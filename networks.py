@@ -5,7 +5,7 @@ import torch.nn as nn
 class VAE_Encoder(nn.Module):
     def __init__(self, input_dim, hidden_dim, latent_dim, num_layers=3):
         super(VAE_Encoder, self).__init__()
-        # Tránh lỗi dropout khi num_layers = 1
+        # Avoid dropout error when num_layers = 1
         dropout_rate = 0.2 if num_layers > 1 else 0.0
         self.lstm = nn.LSTM(input_dim, hidden_dim, num_layers, batch_first=True, dropout=dropout_rate)
         self.fc_mu = nn.Linear(hidden_dim, latent_dim)
@@ -19,7 +19,7 @@ class VAE_Encoder(nn.Module):
         mu = self.fc_mu(out_squeeze)
         logvar = self.fc_logvar(out_squeeze)
 
-        # Defensive clamps
+        # Defensive clamps to prevent numerical instability
         mu = torch.clamp(mu, min=-20.0, max=20.0)
         logvar = torch.clamp(logvar, min=-20.0, max=20.0)
 
@@ -51,7 +51,7 @@ class AutoregressiveVAE(nn.Module):
         self.input_dim = input_dim
         self.hidden_dim = hidden_dim
 
-        # Kiến trúc cVAE: Input Encoder = Input Gốc (x_t) + Error (x_hat) -> dim = input_dim * 2
+        # cVAE Architecture: Input Encoder = Original Input (x_t) + Error (x_hat) -> dim = input_dim * 2
         self.encoder = VAE_Encoder(input_dim * 2, hidden_dim, latent_dim, enc_layers)
         self.decoder = VAE_Decoder(latent_dim, hidden_dim, input_dim, dec_layers)
 
@@ -59,7 +59,7 @@ class AutoregressiveVAE(nn.Module):
         batch_size = x.size(0)
         device = x.device
 
-        # Khởi tạo state
+        # Initialize hidden states
         enc_hidden = (torch.zeros(self.encoder.lstm.num_layers, batch_size, self.hidden_dim, device=device),
                       torch.zeros(self.encoder.lstm.num_layers, batch_size, self.hidden_dim, device=device))
         dec_hidden = (torch.zeros(self.decoder.lstm.num_layers, batch_size, self.hidden_dim, device=device),
@@ -73,18 +73,18 @@ class AutoregressiveVAE(nn.Module):
             x_t = x[:, t, :]
             c_sigmoid = torch.sigmoid(c_prev)
 
-            # Tính phần dư theo đúng VRNN của bạn
+            # Calculate residual error following VRNN logic
             x_hat = x_t - c_sigmoid
 
-            # Đưa qua encoder từng timestep
+            # Pass through encoder for each timestep
             enc_in = torch.cat([x_t, x_hat], dim=1).unsqueeze(1)
             z_t, mu_t, logvar_t, enc_hidden = self.encoder(enc_in, enc_hidden)
 
-            # Giải mã bằng decoder để lấy output cho vòng lặp sau
+            # Decode to get output for the next iteration
             z_in = z_t.unsqueeze(1)
             rec_t, logits_t, dec_hidden = self.decoder(z_in, dec_hidden)
 
-            c_prev = logits_t  # Lưu lại logits (đầu ra trước khi qua sigmoid)
+            c_prev = logits_t  # Save logits (pre-sigmoid output)
 
             rec_list.append(rec_t.unsqueeze(1))
             logits_list.append(logits_t.unsqueeze(1))
@@ -96,7 +96,7 @@ class AutoregressiveVAE(nn.Module):
             torch.cat(mu_list, dim=1), torch.cat(logvar_list, dim=1), torch.cat(z_list, dim=1)
 
     def reconstruct_decoder(self, z_seq):
-        """Hàm dùng cho GAN Generator khi đã có trước chuỗi nhiễu z"""
+        """Function used for GAN Generator when sequence noise z is already provided"""
         batch_size = z_seq.size(0)
         device = z_seq.device
         dec_hidden = (torch.zeros(self.decoder.lstm.num_layers, batch_size, self.hidden_dim, device=device),
@@ -117,13 +117,13 @@ class SequenceDiscriminator(nn.Module):
         super(SequenceDiscriminator, self).__init__()
         dropout_rate = 0.2 if num_layers > 1 else 0.0
         self.lstm = nn.LSTM(input_dim, hidden_dim, num_layers, batch_first=True, dropout=dropout_rate)
-        # Giống hệt tf.layers.flatten(outputs)
+        # Equivalent to tf.layers.flatten(outputs)
         self.fc = nn.Linear(hidden_dim * time_steps, 1)
 
     def forward(self, x):
         out, _ = self.lstm(x)
         out_flat = torch.flatten(out, start_dim=1)
-        logits = self.fc(out_flat).squeeze(-1)  # Output 1 điểm duy nhất
+        logits = self.fc(out_flat).squeeze(-1)  # Output a single score
         return logits, out
 
 
