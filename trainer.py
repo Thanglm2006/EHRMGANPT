@@ -38,6 +38,8 @@ def train_m3gan(dataloader, config, max_val_con, min_val_con):
     optimizer_D = optim.Adam(list(c_dis.parameters()) + list(d_dis.parameters()), lr=config['d_lr'])
 
     bce_with_logits = nn.BCEWithLogitsLoss()
+    scaler = torch.cuda.amp.GradScaler(enabled=config.get('use_amp', False))
+
 
     if config.get('resume_checkpoint') is not None:
         print(f"\nLoading pretrained weights from {config['resume_checkpoint']}...")
@@ -76,28 +78,30 @@ def train_m3gan(dataloader, config, max_val_con, min_val_con):
 
                 optimizer_VAE_pre.zero_grad()
 
-                c_rec, _, c_mu, c_logvar, c_z = c_vae(continuous_x)
-                d_rec, d_logits, d_mu, d_logvar, d_z = d_vae(discrete_x)
+                with torch.cuda.amp.autocast(enabled=config.get('use_amp', False)):
+                    c_rec, _, c_mu, c_logvar, c_z = c_vae(continuous_x)
+                    d_rec, d_logits, d_mu, d_logvar, d_z = d_vae(discrete_x)
 
-                loss_c_rec = F.mse_loss(c_rec, continuous_x)
-                loss_d_rec = F.binary_cross_entropy_with_logits(d_logits, discrete_x)
+                    loss_c_rec = F.mse_loss(c_rec, continuous_x)
+                    loss_d_rec = F.binary_cross_entropy_with_logits(d_logits, discrete_x)
 
-                loss_c_kl = kl_divergence(c_mu, c_logvar)
-                loss_d_kl = kl_divergence(d_mu, d_logvar)
+                    loss_c_kl = kl_divergence(c_mu, c_logvar)
+                    loss_d_kl = kl_divergence(d_mu, d_logvar)
 
-                c_z_flat = c_z.view(c_z.size(0), -1)
-                d_z_flat = d_z.view(d_z.size(0), -1)
-                loss_contrastive = nt_xent_loss(c_z_flat, d_z_flat)
-                loss_matching = F.mse_loss(c_z, d_z)
+                    c_z_flat = c_z.view(c_z.size(0), -1)
+                    d_z_flat = d_z.view(d_z.size(0), -1)
+                    loss_contrastive = nt_xent_loss(c_z_flat, d_z_flat)
+                    loss_matching = F.mse_loss(c_z, d_z)
 
-                total_vae_loss = (config['alpha_re'] * (loss_c_rec + loss_d_rec) +
-                                  config['alpha_kl'] * (loss_c_kl + loss_d_kl) +
-                                  config['alpha_ct'] * loss_contrastive +
-                                  config['alpha_mt'] * loss_matching)
+                    total_vae_loss = (config['alpha_re'] * (loss_c_rec + loss_d_rec) +
+                                      config['alpha_kl'] * (loss_c_kl + loss_d_kl) +
+                                      config['alpha_ct'] * loss_contrastive +
+                                      config['alpha_mt'] * loss_matching)
 
-                total_vae_loss.backward()
+                scaler.scale(total_vae_loss).backward()
                 torch.nn.utils.clip_grad_norm_(vae_params, max_norm=5.0)
-                optimizer_VAE_pre.step()
+                scaler.step(optimizer_VAE_pre)
+                scaler.update()
 
                 epoch_total_loss += total_vae_loss.item()
                 pbar.set_postfix(
@@ -180,71 +184,72 @@ def train_m3gan(dataloader, config, max_val_con, min_val_con):
             d_loss = torch.tensor(0.0)
             for _ in range(config['d_rounds']):
                 optimizer_D.zero_grad()
-                c_vae.eval()
-                d_vae.eval()
+                with torch.cuda.amp.autocast(enabled=config.get('use_amp', False)):
+                    noise_c = torch.randn(batch_size, time_steps, noise_dim, device=device)
+                    noise_d = torch.randn(batch_size, time_steps, noise_dim, device=device)
 
-                noise_c = torch.randn(batch_size, time_steps, noise_dim, device=device)
-                noise_d = torch.randn(batch_size, time_steps, noise_dim, device=device)
+                    h_cpl_c = [torch.zeros(batch_size, hidden_dim, device=device) for _ in range(config['gen_layers'])]
+                    h_cpl_d = [torch.zeros(batch_size, hidden_dim, device=device) for _ in range(config['gen_layers'])]
 
-                h_cpl_c = [torch.zeros(batch_size, hidden_dim, device=device) for _ in range(config['gen_layers'])]
-                h_cpl_d = [torch.zeros(batch_size, hidden_dim, device=device) for _ in range(config['gen_layers'])]
+                    fake_z_c, h_cpl_d = c_gen(noise_c, h_cpl_d)
+                    fake_z_d, h_cpl_c = d_gen(noise_d, h_cpl_c)
 
-                fake_z_c, h_cpl_d = c_gen(noise_c, h_cpl_d)
-                fake_z_d, h_cpl_c = d_gen(noise_d, h_cpl_c)
+                    with torch.no_grad():
+                        fake_c_seq, _ = c_vae.reconstruct_decoder(fake_z_c)
+                        fake_d_seq, _ = d_vae.reconstruct_decoder(fake_z_d)
 
-                with torch.no_grad():
-                    fake_c_seq, _ = c_vae.reconstruct_decoder(fake_z_c)
-                    fake_d_seq, _ = d_vae.reconstruct_decoder(fake_z_d)
+                    c_real_logits, c_real_fm = c_dis(continuous_x)
+                    d_real_logits, _ = d_dis(discrete_x)
+                    c_fake_logits, c_fake_fm = c_dis(fake_c_seq.detach())
+                    d_fake_logits, _ = d_dis(fake_d_seq.detach())
 
-                c_real_logits, c_real_fm = c_dis(continuous_x)
-                d_real_logits, _ = d_dis(discrete_x)
-                c_fake_logits, c_fake_fm = c_dis(fake_c_seq.detach())
-                d_fake_logits, _ = d_dis(fake_d_seq.detach())
+                    d_loss_c = bce_with_logits(c_real_logits, real_labels) + bce_with_logits(c_fake_logits, fake_labels)
+                    d_loss_d = bce_with_logits(d_real_logits, real_labels) + bce_with_logits(d_fake_logits, fake_labels)
+                    d_loss = d_loss_c + d_loss_d
 
-                d_loss_c = bce_with_logits(c_real_logits, real_labels) + bce_with_logits(c_fake_logits, fake_labels)
-                d_loss_d = bce_with_logits(d_real_logits, real_labels) + bce_with_logits(d_fake_logits, fake_labels)
-                d_loss = d_loss_c + d_loss_d
-
-                d_loss.backward()
+                scaler.scale(d_loss).backward()
                 torch.nn.utils.clip_grad_norm_(list(c_dis.parameters()) + list(d_dis.parameters()), max_norm=5.0)
-                optimizer_D.step()
+                scaler.step(optimizer_D)
+                scaler.update()
 
             # --- Update Generator ---
             g_loss = torch.tensor(0.0)
             for _ in range(config['g_rounds']):
                 optimizer_G.zero_grad()
-                noise_c = torch.randn(batch_size, time_steps, noise_dim, device=device)
-                noise_d = torch.randn(batch_size, time_steps, noise_dim, device=device)
+                with torch.cuda.amp.autocast(enabled=config.get('use_amp', False)):
+                    noise_c = torch.randn(batch_size, time_steps, noise_dim, device=device)
+                    noise_d = torch.randn(batch_size, time_steps, noise_dim, device=device)
 
-                h_cpl_c = [torch.zeros(batch_size, hidden_dim, device=device) for _ in range(config['gen_layers'])]
-                h_cpl_d = [torch.zeros(batch_size, hidden_dim, device=device) for _ in range(config['gen_layers'])]
+                    h_cpl_c = [torch.zeros(batch_size, hidden_dim, device=device) for _ in range(config['gen_layers'])]
+                    h_cpl_d = [torch.zeros(batch_size, hidden_dim, device=device) for _ in range(config['gen_layers'])]
 
-                fake_z_c, h_cpl_d = c_gen(noise_c, h_cpl_d)
-                fake_z_d, h_cpl_c = d_gen(noise_d, h_cpl_c)
+                    fake_z_c, h_cpl_d = c_gen(noise_c, h_cpl_d)
+                    fake_z_d, h_cpl_c = d_gen(noise_d, h_cpl_c)
 
-                c_vae.eval()
-                d_vae.eval()
-                fake_c_seq, _ = c_vae.reconstruct_decoder(fake_z_c)
-                fake_d_seq, _ = d_vae.reconstruct_decoder(fake_z_d)
+                    c_vae.eval()
+                    d_vae.eval()
+                    fake_c_seq, _ = c_vae.reconstruct_decoder(fake_z_c)
+                    fake_d_seq, _ = d_vae.reconstruct_decoder(fake_z_d)
 
-                c_fake_logits, c_fake_fm = c_dis(fake_c_seq)
-                d_fake_logits, _ = d_dis(fake_d_seq)
+                    c_fake_logits, c_fake_fm = c_dis(fake_c_seq)
+                    d_fake_logits, _ = d_dis(fake_d_seq)
 
-                with torch.no_grad():
-                    _, c_real_fm = c_dis(continuous_x)
+                    with torch.no_grad():
+                        _, c_real_fm = c_dis(continuous_x)
 
-                g_adv_loss_c = bce_with_logits(c_fake_logits, torch.ones_like(c_fake_logits))
-                g_adv_loss_d = bce_with_logits(d_fake_logits, torch.ones_like(d_fake_logits))
-                g_fm_loss_c = feature_matching_loss(c_fake_fm, c_real_fm)
-                g_fm_loss_d = feature_matching_loss(fake_d_seq, discrete_x)
+                    g_adv_loss_c = bce_with_logits(c_fake_logits, torch.ones_like(c_fake_logits))
+                    g_adv_loss_d = bce_with_logits(d_fake_logits, torch.ones_like(d_fake_logits))
+                    g_fm_loss_c = feature_matching_loss(c_fake_fm, c_real_fm)
+                    g_fm_loss_d = feature_matching_loss(fake_d_seq, discrete_x)
 
-                g_loss_c = config['c_beta_adv'] * g_adv_loss_c + config['c_beta_fm'] * g_fm_loss_c
-                g_loss_d = config['d_beta_adv'] * g_adv_loss_d + config['d_beta_fm'] * g_fm_loss_d
-                g_loss = g_loss_c + g_loss_d
+                    g_loss_c = config['c_beta_adv'] * g_adv_loss_c + config['c_beta_fm'] * g_fm_loss_c
+                    g_loss_d = config['d_beta_adv'] * g_adv_loss_d + config['d_beta_fm'] * g_fm_loss_d
+                    g_loss = g_loss_c + g_loss_d
 
-                g_loss.backward()
+                scaler.scale(g_loss).backward()
                 torch.nn.utils.clip_grad_norm_(list(c_gen.parameters()) + list(d_gen.parameters()), max_norm=5.0)
-                optimizer_G.step()
+                scaler.step(optimizer_G)
+                scaler.update()
 
             epoch_g_loss += g_loss.item()
 
@@ -255,28 +260,30 @@ def train_m3gan(dataloader, config, max_val_con, min_val_con):
                 d_vae.train()
                 optimizer_VAE.zero_grad()
 
-                c_rec, c_logits, c_mu, c_logvar, c_z = c_vae(continuous_x)
-                d_rec, d_logits, d_mu, d_logvar, d_z = d_vae(discrete_x)
+                with torch.cuda.amp.autocast(enabled=config.get('use_amp', False)):
+                    c_rec, c_logits, c_mu, c_logvar, c_z = c_vae(continuous_x)
+                    d_rec, d_logits, d_mu, d_logvar, d_z = d_vae(discrete_x)
 
-                loss_c_rec = F.mse_loss(c_rec, continuous_x)
-                loss_d_rec = F.binary_cross_entropy_with_logits(d_logits, discrete_x)
+                    loss_c_rec = F.mse_loss(c_rec, continuous_x)
+                    loss_d_rec = F.binary_cross_entropy_with_logits(d_logits, discrete_x)
 
-                loss_c_kl = kl_divergence(c_mu, c_logvar)
-                loss_d_kl = kl_divergence(d_mu, d_logvar)
+                    loss_c_kl = kl_divergence(c_mu, c_logvar)
+                    loss_d_kl = kl_divergence(d_mu, d_logvar)
 
-                c_z_flat = c_z.view(c_z.size(0), -1)
-                d_z_flat = d_z.view(d_z.size(0), -1)
-                loss_contrastive = nt_xent_loss(c_z_flat, d_z_flat)
-                loss_matching = F.mse_loss(c_z, d_z)
+                    c_z_flat = c_z.view(c_z.size(0), -1)
+                    d_z_flat = d_z.view(d_z.size(0), -1)
+                    loss_contrastive = nt_xent_loss(c_z_flat, d_z_flat)
+                    loss_matching = F.mse_loss(c_z, d_z)
 
-                total_vae_loss = (config['alpha_re'] * (loss_c_rec + loss_d_rec) +
-                                  config['alpha_kl'] * (loss_c_kl + loss_d_kl) +
-                                  config['alpha_ct'] * loss_contrastive +
-                                  config['alpha_mt'] * loss_matching)
+                    total_vae_loss = (config['alpha_re'] * (loss_c_rec + loss_d_rec) +
+                                      config['alpha_kl'] * (loss_c_kl + loss_d_kl) +
+                                      config['alpha_ct'] * loss_contrastive +
+                                      config['alpha_mt'] * loss_matching)
 
-                total_vae_loss.backward()
+                scaler.scale(total_vae_loss).backward()
                 torch.nn.utils.clip_grad_norm_(vae_params, max_norm=5.0)
-                optimizer_VAE.step()
+                scaler.step(optimizer_VAE)
+                scaler.update()
 
             pbar.set_postfix(
                 d_loss=f"{d_loss.item():.4f}",

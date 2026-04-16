@@ -1,63 +1,54 @@
-# EHR-M-GAN: Project Overview
+# EHR-M-GAN: Project Overview & Architecture
 
-EHR-M-GAN is a deep learning framework designed to generate realistic, synthetic Electronic Health Record (EHR) data. It specifically focuses on mixed-type time-series data: **Continuous vitals** and **Discrete medical interventions**.
+EHR-M-GAN is a generative model specifically designed for **Electronic Health Records (EHR)**. It specializes in generating dual-mode longitudinal data: **Continuous** (vitals signs) and **Discrete** (medical interventions).
 
-## 1. How Training Works
+## 1. Core Model Architecture
 
-The training process is divided into two distinct phases to ensure the model captures both the individual characteristics of the data streams and their complex correlations.
+The project is built on a "Bilateral" architecture that couples two separate pipelines (one for continuous data, one for discrete data) to ensure they stay synchronized.
+
+### A. Autoregressive VAE (Auto-VAE)
+The foundation of the model is a Temporal VAE that handles the time-series nature of EHR data.
+*   **Dual-Input Encoder**: At each timestep $t$, the encoder receives the current data point $x_t$ AND the residual error from the previous reconstruction (to enforce autoregressive learning).
+*   **Latent Bottleneck**: It compresses the input into a latent vector $z_t$ (Patient State).
+*   **LSTM Backbone**: Uses multi-layer LSTMs to maintain long-term memory of a patient's medical history.
+
+### B. Bilateral Generator (Coupled GAN)
+The Generator is the "Brain" of the project. It doesn't generate raw data; instead, it generates the **latent traces** ($z$) that the VAE decoders then turn into real data.
+*   **Coupled LSTM Cells**: A custom LSTM cell that takes its own previous state PLUS the hidden state of the *other* data stream. 
+    *   *Example*: The "Vitals" generator knows what the "Intervention" generator is doing at every second.
+*   **Synchronized Sampling**: This ensures that if the model generates a "High Fever" in the vitals stream, it simultaneously generates "Antipyretics" in the intervention stream.
+
+### C. Sequence Discriminator
+The Discriminator acts as the "Judge."
+*   **Full Temporal Analysis**: Unlike simple discriminators that look at one point in time, this model flattens the *entire* sequence of LSTM hidden states. It judges if the **entire progression** of the patient's stay looks realistic.
+
+---
+
+## 2. Loss Functions (The Learning Signal)
+
+The model learns through a multi-objective loss function:
 
 ### Phase 1: VAE Pretraining
-The goal of this phase is to learn a structured latent representation for both continuous and discrete data.
-- **Continuous VAE**: Learns to encode and reconstruct vitals (e.g., heart rate, blood pressure).
-- **Discrete VAE**: Learns to encode and reconstruct medical interventions (e.g., medication doses, procedures).
-- **Joint Optimization**: Both VAEs are trained together with **Contrastive** and **Matching** losses. This forces the latent spaces of the two streams to be aligned.
+1.  **Reconstruction Loss**: Ensures the VAE can accurately rebuild a patient's record (MSE for vitals, BCE for interventions).
+2.  **KL Divergence**: Regularizes the latent space.
+3.  **Contrastive Loss (NT-Xent)**: Forces the Continuous and Discrete latent vectors to be similar if they belong to the same patient.
+4.  **Latent Matching**: Minimizes the distance between the two streams to enforce coupling.
 
 ### Phase 2: Joint GAN Training
-Once the VAEs provide a stable latent space, the GAN takes over to generate sequences from random noise.
-- **Generator**: Takes Gaussian noise and generates a sequence in the **latent space** ($z$).
-- **Bilateral Mechanism**: The generators for continuous and discrete data are "coupled" using a bilateral LSTM cell, ensuring that the generated interventions correlate with the generated vitals.
-- **Decoder Reconstruction**: The generated latent sequences are passed through the pretrained VAE Decoders to produce the final EHR data.
-- **Discriminator**: Tries to distinguish between real temporal sequences and synthetic ones.
+1.  **Adversarial Loss**: The classic GAN "cat-and-mouse" game between G and D.
+2.  **Feature Matching (FM)**: A statistical stabilizer. It forces the generated data to have the same **mean and standard deviation** as the real medical data across the whole batch.
 
 ---
 
-## 2. Explanation of Losses
-
-### VAE Losses (State Representation)
-- **Reconstruction Loss (`loss_rec`)**:
-    - **Continuous**: Mean Squared Error (MSE) between original and reconstructed vitals.
-    - **Discrete**: Binary Cross Entropy (BCE) for intervention flags.
-- **KL Divergence (`loss_kl`)**: Regularizes the latent space manually to follow a normal distribution.
-- **Contrastive Loss (`loss_ct`)**: Uses **NT-Xent** to align latent vectors of the same patient.
-- **Matching Loss (`loss_mt`)**: MSE between the latent vectors of the two streams.
-
-### GAN Losses (Generation Quality)
-- **Adversarial Loss (`adv_loss`)**: Standard GAN loss (Real vs. Fake).
-- **Feature Matching Loss (`fm_loss`)**: Generator tries to match the statistical distributions of features in the Discriminator.
+## 3. Data Structure
+The model expects data in 3D tensors: `[Batch Size, Time Steps, Features]`.
+*   **Continuous Features (104)**: Vitals like heart rate, oxygen saturation, blood pressure.
+*   **Discrete Features (13)**: Interventions like mechanical ventilation, drug administration, or dialysis.
+*   **Time Steps (24)**: Represents a 24-hour window of clinical monitoring.
 
 ---
 
-## 3. How the Model Learns
-
-The model learns through a multi-stage objective:
-1.  **Compression**: VAEs compress 24-hour sequences into a "clinical state" ($z$).
-2.  **Correlation**: Contrastive loss teaches the model that certain vitals happen alongside certain treatments.
-3.  **Temporal Dynamics**: LSTMs in the GAN learn patient state evolution.
-4.  **Refinement**: The Discriminator provides feedback on overall sequence realism.
-
----
-
-## 4. Data Structure
-
-The project uses data from the **MIMIC-III** dataset.
-
-### Input Format
-The data is structured as 3D Tensors: `(Batch Size, Time Steps, Features)`
-
-| Data Stream | Shape | Examples of Features |
-| :--- | :--- | :--- |
-| **Continuous (Vitals)** | `(N, 24, 104)` | Heart Rate, SpO2, Systolic BP, Temp, etc. |
-| **Discrete (Interventions)** | `(N, 24, 13)` | Vasopressors, Ventilation, Sedation, etc. |
-
--   **Normalization**: Min-max scaled to `[0, 1]`.
--   **Timesteps**: 24 hours at 1-hour intervals.
+## 4. Hardware Optimization (Tesla M40 & RTX 3080)
+The code is optimized for two specific environments:
+*   **RTX 3080**: Uses **Mixed Precision (AMP)** to fit large batches into 10GB VRAM and leverages Tensor Cores for 2-3x faster training.
+*   **Tesla M40**: Leverages the large **24GB VRAM** to handle higher complexity (`hidden_dim=512`) and full precision training.

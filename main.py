@@ -95,7 +95,8 @@ def main(args):
 
         'resume_checkpoint': args.resume_checkpoint,
         'patience': args.patience,
-        'skip_pretrain': args.skip_pretrain
+        'skip_pretrain': args.skip_pretrain,
+        'use_amp': args.use_amp
     }
 
     # 5. Start Training
@@ -133,6 +134,8 @@ if __name__ == '__main__':
     parser.add_argument('--resume_checkpoint', type=str, default=None, help="Path to .pth file to load weights from")
     parser.add_argument('--patience', type=int, default=30, help="Early stopping patience for VAE pretraining")
     parser.add_argument('--skip_pretrain', action='store_true', help="Skip Phase 1: VAE Pretraining and go straight to Joint GAN")
+    parser.add_argument('--use_amp', action='store_true', help="Enable Mixed Precision training (float16) for modern GPUs like RTX 3080")
+
 
 
     args = parser.parse_args()
