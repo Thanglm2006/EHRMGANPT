@@ -4,13 +4,14 @@ import torch.optim as optim
 import torch.nn.functional as F
 import numpy as np
 import os
+from torch.utils.data import DataLoader
 from tqdm import tqdm
 from networks import AutoregressiveVAE, SequenceDiscriminator, BilateralGenerator
 from ultils import nt_xent_loss, kl_divergence, feature_matching_loss, np_rounding
 from visualise import visualise_gan, visualise_vae
 
 
-def train_m3gan(dataloader, config, max_val_con, min_val_con):
+def train_m3gan(dataset, config, max_val_con, min_val_con):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     c_dim, d_dim = config['c_dim'], config['d_dim']
@@ -67,6 +68,9 @@ def train_m3gan(dataloader, config, max_val_con, min_val_con):
 
     if not config.get('skip_pretrain', False):
         print("\n=== Starting Phase 1: VAE Pretraining ===")
+        dataloader = DataLoader(dataset, batch_size=config['pre_batch_size'], shuffle=True, drop_last=True)
+        print(f"Phase 1 Batch Size: {config['pre_batch_size']}, Iterations: {len(dataloader)}")
+
         for epoch in range(config['num_pre_epochs']):
             c_real_lst, c_rec_lst, d_real_lst, d_rec_lst = [], [], [], []
             epoch_total_loss = 0.0
@@ -156,6 +160,8 @@ def train_m3gan(dataloader, config, max_val_con, min_val_con):
     # Phase 2: Joint GAN Training
     # ---------------------------------------------------------
     print("\n=== Starting Phase 2: Joint GAN Training ===")
+    dataloader = DataLoader(dataset, batch_size=config['batch_size'], shuffle=True, drop_last=True)
+    print(f"Phase 2 Batch Size: {config['batch_size']}, Iterations: {len(dataloader)}")
 
     best_gan_loss = float('inf')
     epochs_no_improve_gan = 0

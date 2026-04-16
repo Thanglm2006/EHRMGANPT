@@ -48,16 +48,16 @@ def main(args):
     shared_latent_dim = 25
     noise_dim = min(int(c_dim / 2), int(d_dim / 2))
 
-    # 3. Create PyTorch DataLoader
+    # 3. Create PyTorch Dataset
     dataset = TensorDataset(
         torch.tensor(continuous_x, dtype=torch.float32),
         torch.tensor(discrete_x, dtype=torch.float32)
     )
-    dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, drop_last=True)
 
     # 4. Setup Configuration Dictionary
     config = {
         'batch_size': args.batch_size,
+        'pre_batch_size': args.pre_batch_size,
         'time_steps': time_steps,
         'c_dim': c_dim,
         'd_dim': d_dim,
@@ -101,13 +101,14 @@ def main(args):
 
     # 5. Start Training
     print("Starting EHR-M-GAN PyTorch Training...")
-    train_m3gan(dataloader, config, max_val_con, min_val_con)
+    train_m3gan(dataset, config, max_val_con, min_val_con)
 
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--dataset', type=str, default="mimic", choices=['Mimic3', 'eicu', 'hirid'])
     parser.add_argument('--batch_size', type=int, default=256)
+    parser.add_argument('--pre_batch_size', type=int, default=1024, help="Batch size for Phase 1 (VAE Pretraining). Large batches highly recommended.")
     parser.add_argument('--num_pre_epochs', type=int, default=500)
     parser.add_argument('--num_epochs', type=int, default=800)
     parser.add_argument('--epoch_ckpt_freq', type=int, default=100)
