@@ -3,7 +3,7 @@ import numpy as np
 import pickle
 import argparse
 import os
-from networks import VAE_Decoder, BilateralGenerator
+from networks import AutoregressiveVAE, JointGenerator
 from metrics import evaluate_all
 from ultils import np_rounding
 from visualise import visualise_gan
@@ -25,16 +25,28 @@ def test_model(args):
     discrete_x = np.clip(discrete_x, 0.0, 1.0)
     continuous_x = np.nan_to_num(continuous_x, nan=0.0)
 
-    # Calculate Normalization Stats (Needed for plotting real-world values)
-    min_val_con = np.min(continuous_x, axis=(0, 1))
-    max_val_con = np.max(continuous_x, axis=(0, 1))
-    range_val_con = max_val_con - min_val_con
-    range_val_con[range_val_con == 0] = 1e-6
+    # Load scaling metadata and feature names
+    c_feature_names = None
+    d_feature_names = None
+    if args.clinical_scaler and os.path.exists(args.clinical_scaler):
+        print(f"Applying clinical scaler from: {args.clinical_scaler}")
+        with open(args.clinical_scaler, 'rb') as f:
+            scaler = pickle.load(f)
+        min_val_con = scaler.get('mins')
+        range_val_con = scaler.get('maxes') - min_val_con
+        c_feature_names = scaler.get('feature_names')
+        d_feature_names = scaler.get('discrete_names')
+    else:
+        # If no scaler provided, calculate local stats from the loaded data 
+        # (which is likely already 0-1 normalized).
+        min_val_con = np.min(continuous_x, axis=(0, 1))
+        max_val_con = np.max(continuous_x, axis=(0, 1))
+        range_val_con = max_val_con - min_val_con
+        range_val_con[range_val_con == 0] = 1e-6
 
-    # Normalize continuous data to [0, 1] for the network
-    continuous_x = (continuous_x - min_val_con) / range_val_con
-    max_val_con = range_val_con  # Adjust max for the renormlizer function
-
+    # Data is already 0-1 from the .pkl, so we do not re-normalize.
+    # The min_val_con and range_val_con will be used by the visualizer to un-normalize.
+    
     time_steps = continuous_x.shape[1]
     c_dim = continuous_x.shape[2]
     d_dim = discrete_x.shape[2]
@@ -48,21 +60,22 @@ def test_model(args):
 
     checkpoint = torch.load(args.checkpoint, map_location=device)
 
-    # 2. Initialize Networks (Generators and Decoders only)
-    c_dec = VAE_Decoder(latent_dim, args.gen_num_units, c_dim, args.dec_layers).to(device)
-    d_dec = VAE_Decoder(latent_dim, args.gen_num_units, d_dim, args.dec_layers).to(device)
+    # 2. Initialize Networks
+    c_vae = AutoregressiveVAE(c_dim, args.gen_num_units, latent_dim, args.enc_layers, args.dec_layers, time_steps).to(device)
+    d_vae = AutoregressiveVAE(d_dim, args.gen_num_units, latent_dim, args.enc_layers, args.dec_layers, time_steps).to(device)
 
-    c_gen = BilateralGenerator(noise_dim, args.gen_num_units, latent_dim, args.gen_num_layers).to(device)
-    d_gen = BilateralGenerator(noise_dim, args.gen_num_units, latent_dim, args.gen_num_layers).to(device)
+    joint_gen = JointGenerator(noise_dim, noise_dim, args.gen_num_units, latent_dim, latent_dim, args.gen_num_layers).to(device)
+    c_gen = joint_gen.c_gen
+    d_gen = joint_gen.d_gen
 
     # 3. Load Saved Weights
-    c_dec.load_state_dict(checkpoint['c_dec'])
-    d_dec.load_state_dict(checkpoint['d_dec'])
+    c_vae.load_state_dict(checkpoint['c_vae'])
+    d_vae.load_state_dict(checkpoint['d_vae'])
     c_gen.load_state_dict(checkpoint['c_gen'])
     d_gen.load_state_dict(checkpoint['d_gen'])
 
-    c_dec.eval();
-    d_dec.eval();
+    c_vae.eval();
+    d_vae.eval();
     c_gen.eval();
     d_gen.eval()
 
@@ -78,16 +91,10 @@ def test_model(args):
             noise_c = torch.randn(args.batch_size, time_steps, noise_dim, device=device)
             noise_d = torch.randn(args.batch_size, time_steps, noise_dim, device=device)
 
-            h_cpl_c = [torch.zeros(args.batch_size, args.gen_num_units, device=device) for _ in
-                       range(args.gen_num_layers)]
-            h_cpl_d = [torch.zeros(args.batch_size, args.gen_num_units, device=device) for _ in
-                       range(args.gen_num_layers)]
+            fake_z_c, fake_z_d = joint_gen(noise_c, noise_d)
 
-            fake_z_c, h_cpl_d = c_gen(noise_c, h_cpl_d)
-            fake_z_d, h_cpl_c = d_gen(noise_d, h_cpl_c)
-
-            fake_c_seq, _ = c_dec(fake_z_c)
-            fake_d_seq, _ = d_dec(fake_z_d)
+            fake_c_seq, _ = c_vae.reconstruct_decoder(fake_z_c)
+            fake_d_seq, _ = d_vae.reconstruct_decoder(fake_z_d)
 
             c_gen_data.append(fake_c_seq.cpu().numpy())
             d_gen_data.append(fake_d_seq.cpu().numpy())
@@ -108,10 +115,12 @@ def test_model(args):
     print("Generating visualization plots...")
     save_dir = "Output/test_plots/"
     os.makedirs(save_dir, exist_ok=True)
+    num_plot = 10  # Number of patient samples to overlay in each plot
 
     # Passes the data to visualise_gan to output the PDF
-    visualise_gan(real_c_eval, c_gen_data, real_d_eval, d_gen_data,
-                  inx="Test_Run", max_val_con=max_val_con, min_val_con=min_val_con, SAVE_PATH=save_dir)
+    visualise_gan(real_c_eval, c_gen_data, real_d_eval, d_gen_data, f"Test_Run", range_val_con, min_val_con,
+                  num_dim=12, num_plot=num_plot, SAVE_PATH=save_dir,
+                  c_feature_names=c_feature_names, d_feature_names=d_feature_names)
 
     print(f"✅ Success! PDF Visualizations saved to: {save_dir}visualise_gan_epoch_Test_Run.pdf")
 
@@ -123,8 +132,10 @@ if __name__ == '__main__':
     parser.add_argument('--num_samples', type=int, default=5000,
                         help="Number of synthetic patients to generate for testing")
     parser.add_argument('--batch_size', type=int, default=256, help="Batch size for generation")
+    parser.add_argument('--clinical_scaler', type=str, default=None, help="Path to clinical_scaler.pkl to restore raw units")
 
     # Model architecture parameters (must match the training config)
+    parser.add_argument('--enc_layers', type=int, default=3)
     parser.add_argument('--dec_layers', type=int, default=3)
     parser.add_argument('--gen_num_units', type=int, default=512)
     parser.add_argument('--gen_num_layers', type=int, default=3)

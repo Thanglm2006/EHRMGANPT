@@ -179,3 +179,62 @@ class BilateralGenerator(nn.Module):
             outputs.append(out_t.unsqueeze(1))
 
         return torch.cat(outputs, dim=1), h_states
+
+
+class JointGenerator(nn.Module):
+    def __init__(self, c_noise_dim, d_noise_dim, hidden_dim, c_latent_dim, d_latent_dim, num_layers=3):
+        super(JointGenerator, self).__init__()
+        self.num_layers = num_layers
+        self.hidden_dim = hidden_dim
+        
+        self.c_gen = BilateralGenerator(c_noise_dim, hidden_dim, c_latent_dim, num_layers)
+        self.d_gen = BilateralGenerator(d_noise_dim, hidden_dim, d_latent_dim, num_layers)
+
+    def forward(self, noise_c, noise_d):
+        """
+        Implements the step-by-step bilateral coupling required by EHR-M-GAN.
+        """
+        batch_size, time_steps, _ = noise_c.size()
+        device = noise_c.device
+
+        # Initialize hidden and cell states for both streams
+        c_h = [torch.zeros(batch_size, self.hidden_dim, device=device) for _ in range(self.num_layers)]
+        c_c = [torch.zeros(batch_size, self.hidden_dim, device=device) for _ in range(self.num_layers)]
+        d_h = [torch.zeros(batch_size, self.hidden_dim, device=device) for _ in range(self.num_layers)]
+        d_c = [torch.zeros(batch_size, self.hidden_dim, device=device) for _ in range(self.num_layers)]
+
+        fake_z_c_list = []
+        fake_z_d_list = []
+
+        for t in range(time_steps):
+            # 1. Capture current noise inputs
+            noise_c_t = noise_c[:, t, :]
+            noise_d_t = noise_d[:, t, :]
+
+            # 2. Coupled inputs come from the OTHER stream's PREVIOUS hidden state
+            # (In Step 1, these are the initial zeros)
+            c_h_coupled = d_h
+            d_h_coupled = c_h
+
+            # 3. Step C Generator Layers
+            c_x = noise_c_t
+            for i in range(self.num_layers):
+                c_h[i], c_c[i] = self.c_gen.cells[i](c_x, c_h[i], c_c[i], c_h_coupled[i])
+                c_x = c_h[i]
+            
+            z_c_t = torch.sigmoid(self.c_gen.fc_out(c_x))
+            fake_z_c_list.append(z_c_t.unsqueeze(1))
+
+            # 4. Step D Generator Layers
+            d_x = noise_d_t
+            for i in range(self.num_layers):
+                d_h[i], d_c[i] = self.d_gen.cells[i](d_x, d_h[i], d_c[i], d_h_coupled[i])
+                d_x = d_h[i]
+            
+            z_d_t = torch.sigmoid(self.d_gen.fc_out(d_x))
+            fake_z_d_list.append(z_d_t.unsqueeze(1))
+
+        fake_z_c = torch.cat(fake_z_c_list, dim=1)
+        fake_z_d = torch.cat(fake_z_d_list, dim=1)
+
+        return fake_z_c, fake_z_d

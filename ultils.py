@@ -44,7 +44,8 @@ def feature_matching_loss(fake_features, real_features):
 
 
 def renormlizer(data, max_val, min_val):
-    data = data * max_val
+    # data = Value_norm * (Max - Min + 1e-8) + Min
+    data = data * (max_val + 1e-8)
     data = data + min_val
     return data
 

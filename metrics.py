@@ -90,3 +90,10 @@ def evaluate_all(real_c, fake_c, real_d, fake_d):
     corr_err_d = pearson_correlation_error(real_d, fake_d)
     print(f"Discrete Corr Error (Lower is better):   {corr_err_d:.5f}")
     print("=" * 40 + "\n")
+
+    return {
+        'mmd': float(mmd_score),
+        'rmse': float(rmse_score),
+        'corr_c': float(corr_err_c),
+        'corr_d': float(corr_err_d)
+    }
