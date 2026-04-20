@@ -12,7 +12,34 @@ from visualise import visualise_gan, visualise_vae, plot_metrics_trend
 from metrics import evaluate_all
 
 
-def train_m3gan(dataset, config, max_val_con, min_val_con):
+def compute_gradient_penalty(discriminator, real_samples, fake_samples, device):
+    """Calculates the gradient penalty loss for WGAN GP (Runs in Float32 for stability)"""
+    with torch.amp.autocast(device.type, enabled=False):
+        # Random weight term for interpolation between real and fake samples
+        alpha = torch.rand(real_samples.size(0), 1, 1, device=device)
+        # Get random interpolation between real and fake samples
+        interpolates = (alpha * real_samples + ((1 - alpha) * fake_samples)).requires_grad_(True)
+        
+        # Disable CuDNN temporarily to allow double backward pass through LSTMs for gradient penalty
+        with torch.backends.cudnn.flags(enabled=False):
+            d_interpolates, _ = discriminator(interpolates)
+            
+        fake = torch.ones(real_samples.size(0), device=device)
+    # Get gradient w.r.t. interpolates
+    gradients = torch.autograd.grad(
+        outputs=d_interpolates,
+        inputs=interpolates,
+        grad_outputs=fake,
+        create_graph=True,
+        retain_graph=True,
+        only_inputs=True,
+    )[0]
+    gradients = gradients.reshape(gradients.size(0), -1)
+    gradient_penalty = ((gradients.norm(2, dim=1) - 1) ** 2).mean()
+    return gradient_penalty
+
+
+def train_m3gan(dataset, config, max_val_con, min_val_con, c_feature_names=None, d_feature_names=None):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     c_dim, d_dim = config['c_dim'], config['d_dim']
@@ -186,35 +213,43 @@ def train_m3gan(dataset, config, max_val_con, min_val_con):
                 c_real_lst.append(continuous_x.detach().cpu().numpy())
                 d_real_lst.append(discrete_x.detach().cpu().numpy())
 
-            # Discriminator now outputs [batch_size], so real/fake labels are 1D vectors
-            real_labels = torch.clamp(torch.empty((batch_size,), device=device).uniform_(0.8, 1.0), 0.0, 1.0)
-            fake_labels = torch.empty((batch_size,), device=device).uniform_(0.0, 0.3)
-
-            # --- Update Discriminator ---
+            # --- Update Discriminator (Critic in WGAN) ---
             d_loss = torch.tensor(0.0)
             for _ in range(config['d_rounds']):
                 optimizer_D.zero_grad()
-                with torch.amp.autocast(device.type, enabled=config.get('use_amp', False)):
-                    noise_c = torch.randn(batch_size, time_steps, noise_dim, device=device)
-                    noise_d = torch.randn(batch_size, time_steps, noise_dim, device=device)
+                
+                # To avoid complex graph retention issues with gradient penalty in autocast,
+                # we generate noise and run through models directly.
+                noise_c = torch.randn(batch_size, time_steps, noise_dim, device=device)
+                noise_d = torch.randn(batch_size, time_steps, noise_dim, device=device)
 
+                with torch.no_grad():
                     fake_z_c, fake_z_d = joint_gen(noise_c, noise_d)
+                    fake_c_seq, _ = c_vae.reconstruct_decoder(fake_z_c)
+                    fake_d_seq, _ = d_vae.reconstruct_decoder(fake_z_d)
 
-                    with torch.no_grad():
-                        fake_c_seq, _ = c_vae.reconstruct_decoder(fake_z_c)
-                        fake_d_seq, _ = d_vae.reconstruct_decoder(fake_z_d)
-
-                    c_real_logits, c_real_fm = c_dis(continuous_x)
+                with torch.amp.autocast(device.type, enabled=config.get('use_amp', False)):
+                    c_real_logits, _ = c_dis(continuous_x)
                     d_real_logits, _ = d_dis(discrete_x)
-                    c_fake_logits, c_fake_fm = c_dis(fake_c_seq.detach())
+                    c_fake_logits, _ = c_dis(fake_c_seq.detach())
                     d_fake_logits, _ = d_dis(fake_d_seq.detach())
 
-                    d_loss_c = bce_with_logits(c_real_logits, real_labels) + bce_with_logits(c_fake_logits, fake_labels)
-                    d_loss_d = bce_with_logits(d_real_logits, real_labels) + bce_with_logits(d_fake_logits, fake_labels)
-                    d_loss = d_loss_c + d_loss_d
+                    # WGAN Loss: E[D(fake)] - E[D(real)]
+                    d_loss_c = torch.mean(c_fake_logits) - torch.mean(c_real_logits)
+                    d_loss_d = torch.mean(d_fake_logits) - torch.mean(d_real_logits)
+                    
+                    # Gradient Penalty (Lambda = 10)
+                    gp_c = compute_gradient_penalty(c_dis, continuous_x, fake_c_seq.detach(), device)
+                    gp_d = compute_gradient_penalty(d_dis, discrete_x, fake_d_seq.detach(), device)
+                    
+                    d_loss = d_loss_c + d_loss_d + 10.0 * (gp_c + gp_d)
 
                 scaler.scale(d_loss).backward()
+                
+                # Unscale gradients before clipping when using AMP
+                scaler.unscale_(optimizer_D)
                 torch.nn.utils.clip_grad_norm_(list(c_dis.parameters()) + list(d_dis.parameters()), max_norm=5.0)
+                
                 scaler.step(optimizer_D)
                 scaler.update()
 
@@ -234,22 +269,30 @@ def train_m3gan(dataset, config, max_val_con, min_val_con):
                     fake_d_seq, _ = d_vae.reconstruct_decoder(fake_z_d)
 
                     c_fake_logits, c_fake_fm = c_dis(fake_c_seq)
-                    d_fake_logits, _ = d_dis(fake_d_seq)
+                    d_fake_logits, d_fake_fm = d_dis(fake_d_seq) # Properly extract d_fake_fm
 
                     with torch.no_grad():
                         _, c_real_fm = c_dis(continuous_x)
+                        _, d_real_fm = d_dis(discrete_x) # Properly extract d_real_fm
 
-                    g_adv_loss_c = bce_with_logits(c_fake_logits, torch.ones_like(c_fake_logits))
-                    g_adv_loss_d = bce_with_logits(d_fake_logits, torch.ones_like(d_fake_logits))
+                    # WGAN Generator Loss: -E[D(fake)]
+                    g_adv_loss_c = -torch.mean(c_fake_logits)
+                    g_adv_loss_d = -torch.mean(d_fake_logits)
+                    
+                    # Mathematically corrected Feature Matching loss
                     g_fm_loss_c = feature_matching_loss(c_fake_fm, c_real_fm)
-                    g_fm_loss_d = feature_matching_loss(fake_d_seq, discrete_x)
+                    g_fm_loss_d = feature_matching_loss(d_fake_fm, d_real_fm)
 
                     g_loss_c = config['c_beta_adv'] * g_adv_loss_c + config['c_beta_fm'] * g_fm_loss_c
                     g_loss_d = config['d_beta_adv'] * g_adv_loss_d + config['d_beta_fm'] * g_fm_loss_d
                     g_loss = g_loss_c + g_loss_d
 
                 scaler.scale(g_loss).backward()
+                
+                # Unscale gradients before clipping when using AMP
+                scaler.unscale_(optimizer_G)
                 torch.nn.utils.clip_grad_norm_(joint_gen.parameters(), max_norm=5.0)
+                
                 scaler.step(optimizer_G)
                 scaler.update()
 
@@ -283,7 +326,11 @@ def train_m3gan(dataset, config, max_val_con, min_val_con):
                                       config['alpha_mt'] * loss_matching)
 
                 scaler.scale(total_vae_loss).backward()
+                
+                # Unscale gradients before clipping when using AMP
+                scaler.unscale_(optimizer_VAE)
                 torch.nn.utils.clip_grad_norm_(vae_params, max_norm=5.0)
+                
                 scaler.step(optimizer_VAE)
                 scaler.update()
 

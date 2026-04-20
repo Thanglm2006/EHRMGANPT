@@ -1,5 +1,31 @@
 import torch
 import torch.nn as nn
+from torch.nn.utils import spectral_norm
+
+class TemporalSelfAttention(nn.Module):
+    def __init__(self, hidden_dim):
+        super(TemporalSelfAttention, self).__init__()
+        self.query = nn.Linear(hidden_dim, hidden_dim // 8)
+        self.key = nn.Linear(hidden_dim, hidden_dim // 8)
+        self.value = nn.Linear(hidden_dim, hidden_dim)
+        self.gamma = nn.Parameter(torch.zeros(1))
+
+    def forward(self, x):
+        # x shape: (batch_size, time_steps, hidden_dim)
+        batch_size, time_steps, hidden_dim = x.size()
+        
+        proj_query = self.query(x).view(batch_size, -1, time_steps).permute(0, 2, 1) # B x T x C
+        proj_key = self.key(x).view(batch_size, -1, time_steps) # B x C x T
+        
+        energy = torch.bmm(proj_query, proj_key) # B x T x T
+        attention = torch.softmax(energy, dim=-1)
+        
+        proj_value = self.value(x).view(batch_size, -1, time_steps) # B x C x T
+        out = torch.bmm(proj_value, attention.permute(0, 2, 1)) # B x C x T
+        out = out.view(batch_size, time_steps, hidden_dim)
+        
+        out = self.gamma * out + x
+        return out
 
 
 class VAE_Encoder(nn.Module):
@@ -117,13 +143,16 @@ class SequenceDiscriminator(nn.Module):
         super(SequenceDiscriminator, self).__init__()
         dropout_rate = 0.2 if num_layers > 1 else 0.0
         self.lstm = nn.LSTM(input_dim, hidden_dim, num_layers, batch_first=True, dropout=dropout_rate)
-        # Equivalent to tf.layers.flatten(outputs)
-        self.fc = nn.Linear(hidden_dim * time_steps, 1)
+        # Add Self Attention for advanced global pooling
+        self.attn = TemporalSelfAttention(hidden_dim)
+        # Use spectral normalization to enforce Lipschitz continuity for WGAN-GP
+        self.fc = spectral_norm(nn.Linear(hidden_dim * time_steps, 1))
 
     def forward(self, x):
         out, _ = self.lstm(x)
+        out = self.attn(out)
         out_flat = torch.flatten(out, start_dim=1)
-        logits = self.fc(out_flat).squeeze(-1)  # Output a single score
+        logits = self.fc(out_flat).squeeze(-1)  # Output an unbounded critic score for WGAN
         return logits, out
 
 
@@ -190,9 +219,14 @@ class JointGenerator(nn.Module):
         self.c_gen = BilateralGenerator(c_noise_dim, hidden_dim, c_latent_dim, num_layers)
         self.d_gen = BilateralGenerator(d_noise_dim, hidden_dim, d_latent_dim, num_layers)
 
+        # Advanced Attention to resolve generator mode-collapse on patterns
+        self.c_attn = TemporalSelfAttention(hidden_dim)
+        self.d_attn = TemporalSelfAttention(hidden_dim)
+
     def forward(self, noise_c, noise_d):
         """
-        Implements the step-by-step bilateral coupling required by EHR-M-GAN.
+        Implements the step-by-step bilateral coupling required by EHR-M-GAN,
+        enhanced with sequence-level Self-Attention for continuous distributions.
         """
         batch_size, time_steps, _ = noise_c.size()
         device = noise_c.device
@@ -203,8 +237,8 @@ class JointGenerator(nn.Module):
         d_h = [torch.zeros(batch_size, self.hidden_dim, device=device) for _ in range(self.num_layers)]
         d_c = [torch.zeros(batch_size, self.hidden_dim, device=device) for _ in range(self.num_layers)]
 
-        fake_z_c_list = []
-        fake_z_d_list = []
+        c_features_list = []
+        d_features_list = []
 
         for t in range(time_steps):
             # 1. Capture current noise inputs
@@ -212,7 +246,6 @@ class JointGenerator(nn.Module):
             noise_d_t = noise_d[:, t, :]
 
             # 2. Coupled inputs come from the OTHER stream's PREVIOUS hidden state
-            # (In Step 1, these are the initial zeros)
             c_h_coupled = d_h
             d_h_coupled = c_h
 
@@ -222,8 +255,7 @@ class JointGenerator(nn.Module):
                 c_h[i], c_c[i] = self.c_gen.cells[i](c_x, c_h[i], c_c[i], c_h_coupled[i])
                 c_x = c_h[i]
             
-            z_c_t = torch.sigmoid(self.c_gen.fc_out(c_x))
-            fake_z_c_list.append(z_c_t.unsqueeze(1))
+            c_features_list.append(c_x.unsqueeze(1))
 
             # 4. Step D Generator Layers
             d_x = noise_d_t
@@ -231,10 +263,18 @@ class JointGenerator(nn.Module):
                 d_h[i], d_c[i] = self.d_gen.cells[i](d_x, d_h[i], d_c[i], d_h_coupled[i])
                 d_x = d_h[i]
             
-            z_d_t = torch.sigmoid(self.d_gen.fc_out(d_x))
-            fake_z_d_list.append(z_d_t.unsqueeze(1))
+            d_features_list.append(d_x.unsqueeze(1))
 
-        fake_z_c = torch.cat(fake_z_c_list, dim=1)
-        fake_z_d = torch.cat(fake_z_d_list, dim=1)
+        # Apply Global Attention across the sequence to fix discrete pattern loss
+        c_temporal = torch.cat(c_features_list, dim=1)
+        d_temporal = torch.cat(d_features_list, dim=1)
 
-        return fake_z_c, fake_z_d
+        c_attn_out = self.c_attn(c_temporal)
+        d_attn_out = self.d_attn(d_temporal)
+
+        # Removed restrictive sigmoid constraint on generator output.
+        # WGAN natively handles unconstrained generated latents (matches VAE true N(mu, sigma) mapping).
+        fake_z_c = self.c_gen.fc_out(c_attn_out)
+        fake_z_d = self.d_gen.fc_out(d_attn_out)
+
+        return fake_z_c, fake_z_d

@@ -18,7 +18,7 @@ if __name__ == '__main__':
     parser.add_argument('--num_pre_epochs', type=int, default=500)
     parser.add_argument('--num_epochs', type=int, default=800)
     parser.add_argument('--epoch_ckpt_freq', type=int, default=100)
-    parser.add_argument('--d_rounds', type=int, default=2)
+    parser.add_argument('--d_rounds', type=int, default=5, help="WGAN-GP Standard Critic Steps")
     parser.add_argument('--g_rounds', type=int, default=1)
     parser.add_argument('--v_rounds', type=int, default=1)
     parser.add_argument('--v_lr_pre', type=float, default=0.0005)
