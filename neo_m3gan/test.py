@@ -13,8 +13,13 @@ def test_model(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
-    # 1. Load Real Data (for comparison)
-    data_path = os.path.join('Data/', args.dataset)
+    # Get the directory where test.py is located
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    
+    # 1. Load Real Data (Data is always in the root folder, one level up from neo_m3gan/)
+    data_path = os.path.abspath(os.path.join(current_dir, '..', 'Data', args.dataset))
+    print(f"Using Data directory: {data_path}")
+
     with open(os.path.join(data_path, 'vital_sign_24hrs.pkl'), 'rb') as f:
         continuous_x = pickle.load(f)
     with open(os.path.join(data_path, 'med_interv_24hrs.pkl'), 'rb') as f:
@@ -63,11 +68,50 @@ def test_model(args):
     latent_dim = 25
     noise_dim = min(int(c_dim / 2), int(d_dim / 2))
 
-    print(f"Loading checkpoint: {args.checkpoint}...")
-    if not os.path.exists(args.checkpoint):
-        raise FileNotFoundError(f"Checkpoint not found at {args.checkpoint}")
+    # --- SMART CHECKPOINT RESOLUTION ---
+    # We prioritize the provided path, but fallback to root/parent folders and 
+    # handle common naming discrepancies (like the 'neo_' prefix) to be helpful.
+    
+    checkpoint_path = args.checkpoint
+    search_paths = [
+        checkpoint_path,                                      # 1. Exact path provided
+        os.path.join(current_dir, checkpoint_path),           # 2. Local to script
+        os.path.join(current_dir, '..', checkpoint_path),     # 3. One level up (project root)
+    ]
+    
+    # Also search for 'm3gan_...' if 'neo_m3gan_...' was requested (and vice-versa)
+    base = os.path.basename(checkpoint_path)
+    alt_base = base.replace("neo_", "", 1) if base.startswith("neo_") else f"neo_{base}"
+    if alt_base != base:
+        dir_name = os.path.dirname(checkpoint_path)
+        search_paths.extend([
+            os.path.join(dir_name, alt_base),
+            os.path.join(current_dir, dir_name, alt_base),
+            os.path.join(current_dir, '..', dir_name, alt_base),
+        ])
 
-    checkpoint = torch.load(args.checkpoint, map_location=device)
+    found_path = None
+    for p in search_paths:
+        abs_p = os.path.abspath(p)
+        if os.path.exists(abs_p) and os.path.isfile(abs_p):
+            found_path = abs_p
+            break
+            
+    if not found_path:
+        print("\n❌ ERROR: Checkpoint not found!")
+        print(f"Tried searching for: '{args.checkpoint}' and variants.")
+        print("\nAvailable checkpoints in this project:")
+        # List a few available ones to help the user
+        root_dir = os.path.abspath(os.path.join(current_dir, '..'))
+        for r, d, f in os.walk(root_dir):
+            if "checkpoint" in r.lower():
+                for file in f:
+                    if file.endswith(".pth"):
+                        print(f" - {os.path.relpath(os.path.join(r, file), current_dir)}")
+        raise FileNotFoundError(f"Missing checkpoint: {args.checkpoint}")
+
+    print(f"[OK] Found checkpoint: {found_path}")
+    checkpoint = torch.load(found_path, map_location=device)
 
     # 2. Initialize Networks
     c_vae = AutoregressiveVAE(c_dim, args.gen_num_units, latent_dim, args.enc_layers, args.dec_layers, time_steps).to(device)
@@ -122,22 +166,25 @@ def test_model(args):
 
     # 6. Save Visualization PDF
     print("Generating visualization plots...")
-    save_dir = "Output/test_plots/"
+    save_dir = args.save_dir
     os.makedirs(save_dir, exist_ok=True)
     num_plot = 10  # Number of patient samples to overlay in each plot
 
+    # Extract epoch or filename to use as an identifier in the visualization saved images
+    inx_id = checkpoint.get('epoch', os.path.basename(found_path).split('.')[0])
+
     # Passes the data to visualise_gan to output the PDF
-    visualise_gan(real_c_eval, c_gen_data, real_d_eval, d_gen_data, f"Test_Run", range_val_con, min_val_con,
+    visualise_gan(real_c_eval, c_gen_data, real_d_eval, d_gen_data, inx_id, range_val_con, min_val_con,
                   num_dim=12, num_plot=num_plot, SAVE_PATH=save_dir,
                   c_feature_names=c_feature_names, d_feature_names=d_feature_names)
 
-    print(f"✅ Success! PDF Visualizations saved to: {save_dir}visualise_gan_epoch_Test_Run.pdf")
+    print(f"Success! PDF Visualizations saved to: {save_dir}")
 
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--dataset', type=str, default="Mimic3", help="Dataset folder name")
-    parser.add_argument('--checkpoint', type=str, required=True, help="Path to the saved .pth file")
+    parser.add_argument('--checkpoint', type=str, default="Output/checkpoint/neo_m3gan_100.pth", help="Path to the saved .pth file")
     parser.add_argument('--num_samples', type=int, default=5000,
                         help="Number of synthetic patients to generate for testing")
     parser.add_argument('--batch_size', type=int, default=256, help="Batch size for generation")
@@ -148,6 +195,7 @@ if __name__ == '__main__':
     parser.add_argument('--dec_layers', type=int, default=3)
     parser.add_argument('--gen_num_units', type=int, default=512)
     parser.add_argument('--gen_num_layers', type=int, default=3)
+    parser.add_argument('--save_dir', type=str, default="Output/test_plots/")
 
     args = parser.parse_args()
     test_model(args)

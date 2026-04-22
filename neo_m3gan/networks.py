@@ -160,11 +160,11 @@ class BilateralLSTMCell(nn.Module):
     def __init__(self, input_dim, hidden_dim):
         super(BilateralLSTMCell, self).__init__()
         self.hidden_dim = hidden_dim
-        self.linear = nn.Linear(input_dim + hidden_dim + hidden_dim, 4 * hidden_dim, bias=False)
+        self.ln = nn.Linear(input_dim + hidden_dim + hidden_dim, 4 * hidden_dim, bias=False)
 
     def forward(self, x, h_self, c_self, h_coupled):
         combined = torch.cat([x, h_self, h_coupled], dim=1)
-        gates = self.linear(combined)
+        gates = self.ln(combined)
         i_gate, f_gate, o_gate, c_tilde = gates.chunk(4, dim=1)
 
         i = torch.sigmoid(i_gate)
@@ -183,7 +183,7 @@ class BilateralGenerator(nn.Module):
         self.num_layers = num_layers
         self.hidden_dim = hidden_dim
 
-        self.cells = nn.ModuleList([
+        self.cl = nn.ModuleList([
             BilateralLSTMCell(
                 input_dim=noise_dim if i == 0 else hidden_dim,
                 hidden_dim=hidden_dim
@@ -201,7 +201,7 @@ class BilateralGenerator(nn.Module):
             x_t = noise_seq[:, t, :]
             for i in range(self.num_layers):
                 h_cpl = h_coupled_states[i]
-                h_states[i], c_states[i] = self.cells[i](x_t, h_states[i], c_states[i], h_cpl)
+                h_states[i], c_states[i] = self.cl[i](x_t, h_states[i], c_states[i], h_cpl)
                 x_t = h_states[i]
 
             out_t = torch.sigmoid(self.fc_out(x_t))
@@ -252,7 +252,7 @@ class JointGenerator(nn.Module):
             # 3. Step C Generator Layers
             c_x = noise_c_t
             for i in range(self.num_layers):
-                c_h[i], c_c[i] = self.c_gen.cells[i](c_x, c_h[i], c_c[i], c_h_coupled[i])
+                c_h[i], c_c[i] = self.c_gen.cl[i](c_x, c_h[i], c_c[i], c_h_coupled[i])
                 c_x = c_h[i]
             
             c_features_list.append(c_x.unsqueeze(1))
@@ -260,7 +260,7 @@ class JointGenerator(nn.Module):
             # 4. Step D Generator Layers
             d_x = noise_d_t
             for i in range(self.num_layers):
-                d_h[i], d_c[i] = self.d_gen.cells[i](d_x, d_h[i], d_c[i], d_h_coupled[i])
+                d_h[i], d_c[i] = self.d_gen.cl[i](d_x, d_h[i], d_c[i], d_h_coupled[i])
                 d_x = d_h[i]
             
             d_features_list.append(d_x.unsqueeze(1))

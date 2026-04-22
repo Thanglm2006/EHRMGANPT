@@ -75,8 +75,16 @@ def visualise_gan(data_continuous_real, data_continuous_syn, data_discrete_real,
         ax.set_ylabel("Patient Sample", fontsize=20)
         ax.set_xlabel("Time Step (hrs)", fontsize=20)
 
-    plt.tight_layout(rect=[0, 0.03, 1, 0.95])
-    fig.savefig(os.path.join(SAVE_PATH, f'visualise_gan_epoch_{inx}.pdf'), format='pdf')
+    # Adjust layout to prevent overlap with huge suptitle
+    plt.tight_layout(rect=[0, 0.03, 1, 0.93])
+    
+    # Sanitize inx for filename (removes invalid filesystem characters)
+    safe_inx = str(inx)
+    if len(safe_inx) > 100: safe_inx = safe_inx[:100]
+    for char in ['{', '}', ':', '"', "'", '[', ']', ' ', '\n', '\t', '\\', '/']:
+        safe_inx = safe_inx.replace(char, '_')
+
+    fig.savefig(os.path.join(SAVE_PATH, f'visualise_gan_epoch_{safe_inx}.pdf'), format='pdf')
     plt.close(fig)
 
 
@@ -119,8 +127,16 @@ def visualise_vae(data_continuous_real, data_continuous_syn, data_discrete_real,
         ax.set_ylabel("Probability", fontsize=20)
         ax.set_xlabel("Time Step (hrs)", fontsize=20)
 
-    plt.tight_layout(rect=[0, 0.03, 1, 0.95])
-    fig.savefig(os.path.join(SAVE_PATH, f'visualise_vae_epoch_{inx}.pdf'), format='pdf')
+    # Adjust layout to prevent overlap with huge suptitle
+    plt.tight_layout(rect=[0, 0.03, 1, 0.93])
+    
+    # Sanitize inx for filename
+    safe_inx = str(inx)
+    if len(safe_inx) > 100: safe_inx = safe_inx[:100]
+    for char in ['{', '}', ':', '"', "'", '[', ']', ' ', '\n', '\t', '\\', '/']:
+        safe_inx = safe_inx.replace(char, '_')
+
+    fig.savefig(os.path.join(SAVE_PATH, f'visualise_vae_epoch_{safe_inx}.pdf'), format='pdf')
     plt.close(fig)
 
 

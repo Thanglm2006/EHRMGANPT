@@ -15,8 +15,12 @@ print(f"Using device: {device}")
 
 
 def main(args):
-    # 1. Load Real Data
-    data_path = os.path.join('Data/', args.dataset)
+    # Get the directory where main.py is located
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+
+    # 1. Load Real Data (Data is always in the root folder, one level up from neo_m3gan/)
+    data_path = os.path.abspath(os.path.join(current_dir, '..', 'Data', args.dataset))
+    print(f"Using Data directory: {data_path}")
 
     with open(os.path.join(data_path, 'vital_sign_24hrs.pkl'), 'rb') as f:
         continuous_x = pickle.load(f)
