@@ -1,6 +1,7 @@
 import numpy as np
 from sklearn.metrics.pairwise import rbf_kernel
 import warnings
+import torch
 
 
 def discrete_probability_rmse(real_d, fake_d):
@@ -16,32 +17,86 @@ def discrete_probability_rmse(real_d, fake_d):
     return rmse
 
 
-def mmd_rbf(real_c, fake_c):
-    """
-    Calculates Maximum Mean Discrepancy (MMD) using an RBF kernel
-    tuned via the Median Heuristic for high-dimensional timeseries.
-    """
-    from sklearn.metrics.pairwise import euclidean_distances
+def _mix_rbf_kernel(X, Y, sigmas, wts=None):
+    if wts is None:
+        wts = [1.0] * sigmas.shape[0]
 
-    X_flat = real_c.reshape(real_c.shape[0], -1)
-    Y_flat = fake_c.reshape(fake_c.shape[0], -1)
+    # Flatten dimensions similar to tf.tensordot(axes=[[1, 2], [1, 2]])
+    X_flat = X.reshape(X.shape[0], -1)
+    Y_flat = Y.reshape(Y.shape[0], -1)
 
-    # Median Heuristic to find the proper RBF bandwidth (gamma)
-    dists = euclidean_distances(X_flat, X_flat)
-    sigma = np.median(dists[dists > 0])
+    XX = torch.matmul(X_flat, X_flat.t())
+    XY = torch.matmul(X_flat, Y_flat.t())
+    YY = torch.matmul(Y_flat, Y_flat.t())
 
-    # Prevent division by zero if all data is identical
-    if sigma == 0:
-        sigma = 1.0
+    X_sqnorms = torch.diag(XX)
+    Y_sqnorms = torch.diag(YY)
 
-    gamma = 1.0 / (2.0 * (sigma ** 2))
+    K_XX, K_XY, K_YY = 0., 0., 0.
+    for sigma, wt in zip(sigmas, wts):
+        gamma = 1 / (2 * sigma ** 2)
+        K_XX += wt * torch.exp(-gamma * (-2 * XX + X_sqnorms.unsqueeze(1) + X_sqnorms.unsqueeze(0)))
+        # X_sqnorms is (batch_x,), shape (m, 1) and Y_sqnorms is (batch_y,), shape (1, n)
+        K_XY += wt * torch.exp(-gamma * (-2 * XY + X_sqnorms.unsqueeze(1) + Y_sqnorms.unsqueeze(0)))
+        K_YY += wt * torch.exp(-gamma * (-2 * YY + Y_sqnorms.unsqueeze(1) + Y_sqnorms.unsqueeze(0)))
 
-    XX = rbf_kernel(X_flat, X_flat, gamma)
-    YY = rbf_kernel(Y_flat, Y_flat, gamma)
-    XY = rbf_kernel(X_flat, Y_flat, gamma)
+    return K_XX, K_XY, K_YY, sum(wts)
 
-    mmd = XX.mean() + YY.mean() - 2 * XY.mean()
-    return mmd
+
+def _mmd2(K_XX, K_XY, K_YY, const_diagonal=False, biased=False):
+    m = K_XX.shape[0]
+    n = K_YY.shape[0]
+
+    if biased:
+        mmd2 = (torch.sum(K_XX) / (m * m)
+                + torch.sum(K_YY) / (n * n)
+                - 2 * torch.sum(K_XY) / (m * n))
+    else:
+        if const_diagonal is not False:
+            trace_X = m * const_diagonal
+            trace_Y = n * const_diagonal
+        else:
+            trace_X = torch.trace(K_XX)
+            trace_Y = torch.trace(K_YY)
+
+        mmd2 = ((torch.sum(K_XX) - trace_X) / (m * (m - 1))
+                + (torch.sum(K_YY) - trace_Y) / (n * (n - 1))
+                - 2 * torch.sum(K_XY) / (m * n))
+
+    return mmd2
+
+
+def mix_rbf_mmd2(X, Y, sigmas=None, wts=None, biased=True):
+    if sigmas is None:
+        sigmas = torch.tensor([1.0, 2.0, 4.0, 8.0, 16.0], device=X.device)
+    K_XX, K_XY, K_YY, d = _mix_rbf_kernel(X, Y, sigmas, wts)
+    return _mmd2(K_XX, K_XY, K_YY, const_diagonal=d, biased=biased)
+
+
+def max_mean_discrepancy(real_data, syn_data, bandwidths=None):
+    if not isinstance(real_data, torch.Tensor):
+        X = torch.tensor(real_data, dtype=torch.float32)
+    else:
+        X = real_data.float()
+        
+    if not isinstance(syn_data, torch.Tensor):
+        Y = torch.tensor(syn_data, dtype=torch.float32)
+    else:
+        Y = syn_data.float()
+
+    if bandwidths is not None:
+        if not isinstance(bandwidths, torch.Tensor):
+            bandwidths = torch.tensor(bandwidths, dtype=torch.float32, device=X.device)
+
+    # Move Y to X device in case they differ
+    Y = Y.to(X.device)
+    
+    mmd2_value = mix_rbf_mmd2(X, Y, sigmas=bandwidths, biased=True) 
+
+    # Prevent nan from sqrt of tiny negative numbers due to floating point precision
+    mmd2_value = torch.clamp(mmd2_value, min=0.0) 
+    
+    return torch.sqrt(mmd2_value).item()
 
 
 def pearson_correlation_error(real_data, fake_data):
@@ -75,7 +130,7 @@ def evaluate_all(real_c, fake_c, real_d, fake_d):
     print("=" * 40)
 
     # 1. Continuous MMD
-    mmd_score = mmd_rbf(real_c, fake_c)
+    mmd_score = max_mean_discrepancy(real_c, fake_c)
     print(f"Continuous MMD (Lower is better):      {mmd_score:.5f}")
 
     # 2. Discrete Probability RMSE
