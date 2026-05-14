@@ -277,4 +277,4 @@ class JointGenerator(nn.Module):
         fake_z_c = self.c_gen.fc_out(c_attn_out)
         fake_z_d = self.d_gen.fc_out(d_attn_out)
 
-        return fake_z_c, fake_z_d
+        return fake_z_c, fake_z_d

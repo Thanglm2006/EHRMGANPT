@@ -107,10 +107,10 @@ def main(args):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--dataset', type=str, default="mimic", choices=['Mimic3', 'eicu', 'hirid'])
-    parser.add_argument('--batch_size', type=int, default=256)
+    parser.add_argument('--batch_size', type=int, default=128)
     parser.add_argument('--pre_batch_size', type=int, default=1024, help="Batch size for Phase 1 (VAE Pretraining). Large batches highly recommended.")
     parser.add_argument('--num_pre_epochs', type=int, default=500)
-    parser.add_argument('--num_epochs', type=int, default=800)
+    parser.add_argument('--num_epochs', type=int, default=200)
     parser.add_argument('--epoch_ckpt_freq', type=int, default=100)
     parser.add_argument('--d_rounds', type=int, default=2)
     parser.add_argument('--g_rounds', type=int, default=1)
