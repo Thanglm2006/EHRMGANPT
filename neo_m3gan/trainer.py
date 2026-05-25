@@ -35,7 +35,9 @@ def compute_gradient_penalty(discriminator, real_samples, fake_samples, device):
         only_inputs=True,
     )[0]
     gradients = gradients.reshape(gradients.size(0), -1)
-    gradient_penalty = ((gradients.norm(2, dim=1) - 1) ** 2).mean()
+    # Add epsilon to L2 norm calculation to prevent division-by-zero NaN in autograd
+    grad_norms = torch.sqrt(torch.sum(gradients ** 2, dim=1) + 1e-12)
+    gradient_penalty = ((grad_norms - 1) ** 2).mean()
     return gradient_penalty
 
 

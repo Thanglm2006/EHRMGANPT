@@ -14,15 +14,14 @@ class TemporalSelfAttention(nn.Module):
         # x shape: (batch_size, time_steps, hidden_dim)
         batch_size, time_steps, hidden_dim = x.size()
         
-        proj_query = self.query(x).view(batch_size, -1, time_steps).permute(0, 2, 1) # B x T x C
-        proj_key = self.key(x).view(batch_size, -1, time_steps) # B x C x T
+        proj_query = self.query(x) # B x T x C (where C = hidden_dim // 8)
+        proj_key = self.key(x).permute(0, 2, 1) # B x C x T
         
         energy = torch.bmm(proj_query, proj_key) # B x T x T
         attention = torch.softmax(energy, dim=-1)
         
-        proj_value = self.value(x).view(batch_size, -1, time_steps) # B x C x T
-        out = torch.bmm(proj_value, attention.permute(0, 2, 1)) # B x C x T
-        out = out.view(batch_size, time_steps, hidden_dim)
+        proj_value = self.value(x) # B x T x H
+        out = torch.bmm(attention, proj_value) # B x T x H
         
         out = self.gamma * out + x
         return out
