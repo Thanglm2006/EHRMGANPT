@@ -4,3 +4,5 @@
 /logs/*
 /Result/*
 /neo_m3gan/Output/*
+/neo_m3gan_v2/Output/*
+/neo_m3gan_v2/Output/checkpoints/*
